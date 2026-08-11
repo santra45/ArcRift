@@ -2,7 +2,9 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import path from "path";
 import fs from "fs";
+import { v4 as uuidv4 } from "uuid";
 import { logger } from "../utils/logger";
+import { isValidObjectId } from "../utils/validators";
 
 function getDbPath() {
   return process.env.SQLITE_DB_PATH || path.join(process.cwd(), "ArcRift.db");
@@ -205,7 +207,79 @@ function createTables() {
     )
   `);
 
+  migrateInvalidSessionIds();
+
   logger.success("All SQLite tables initialized successfully");
+}
+
+/**
+ * Migration: re-key sessions whose ID fails isValidObjectId() (v1.6.4)
+ *
+ * Older builds of the store_memory MCP tool passed the project name as a
+ * customId, so sessions were created with IDs like "AIProductQA" instead of a
+ * UUID. Every REST route that validates a sessionId rejects those, so the
+ * affected project returns 400 "Invalid sessionId format" in the dashboard and
+ * extension even though the MCP tools themselves work fine.
+ *
+ * Runs after all tables exist so the references can be moved in one pass. The
+ * old row is deleted only once nothing points at it, so the ON DELETE CASCADE
+ * foreign keys never fire.
+ */
+function migrateInvalidSessionIds() {
+  // Tables holding a plain sessionId column pointing at sessions.id
+  const referencingTables = ["full_chats", "facts", "chunk_metadata", "active_session"];
+
+  try {
+    const invalid = (db.prepare("SELECT * FROM sessions").all() as any[])
+      .filter(s => !isValidObjectId(String(s.id)));
+    if (invalid.length === 0) return;
+
+    // Read the column list so the ALTERs above (externalChatId, tokensSaved,
+    // retrievalCount, ...) are carried over without being hardcoded here.
+    const columns = (db.prepare("PRAGMA table_info(sessions)").all() as any[])
+      .map(c => c.name as string);
+    const insertSession = db.prepare(
+      `INSERT INTO sessions (${columns.map(c => `"${c}"`).join(", ")}) ` +
+      `VALUES (${columns.map(() => "?").join(", ")})`
+    );
+
+    for (const session of invalid) {
+      const oldId = String(session.id);
+      const newId = uuidv4();
+
+      db.transaction(() => {
+        // Parent first, so the children never point at a missing row.
+        // externalChatId is UNIQUE, so it is restored after the old row is gone.
+        insertSession.run(...columns.map(c => {
+          if (c === "id") return newId;
+          if (c === "externalChatId") return null;
+          return session[c];
+        }));
+
+        for (const table of referencingTables) {
+          db.prepare(`UPDATE "${table}" SET sessionId = ? WHERE sessionId = ?`).run(newId, oldId);
+        }
+
+        // Jobs keep their sessionId inside the JSON payload.
+        db.prepare(
+          "UPDATE jobs SET payload = json_set(payload, '$.sessionId', ?) " +
+          "WHERE json_extract(payload, '$.sessionId') = ?"
+        ).run(newId, oldId);
+
+        // Safe now: nothing references oldId, so the CASCADE deletes nothing.
+        db.prepare("DELETE FROM sessions WHERE id = ?").run(oldId);
+        db.prepare("UPDATE sessions SET externalChatId = ? WHERE id = ?")
+          .run(session.externalChatId ?? null, newId);
+      })();
+
+      logger.info(
+        `Database migration: re-keyed session "${session.projectName}" ` +
+        `from "${oldId}" to ${newId} (v1.6.4)`
+      );
+    }
+  } catch (e) {
+    logger.warn(`Session ID migration warning: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 export function getSqlite(): Database.Database {

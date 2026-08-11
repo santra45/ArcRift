@@ -24,7 +24,10 @@ export async function store(
       
       if (!session) {
         logger.info(`[ArcRift MCP] Auto-creating project: "${projectStr}"`);
-        session = await sessionStore.createSession(projectStr, "mcp", undefined, projectStr);
+        // Let the store generate the ID. Passing the project name as a customId
+        // produces a session ID that isValidObjectId() rejects, which 400s every
+        // REST route (dashboard, extension) that touches the project.
+        session = await sessionStore.createSession(projectStr, "mcp");
       }
     }
 
