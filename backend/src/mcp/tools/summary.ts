@@ -5,17 +5,21 @@
  */
 
 import { sessionStore, graphStore } from "../../services/storage";
+import { resolveSession } from "./resolve";
 
 export async function getSummary(project: string): Promise<string> {
   try {
     const projectStr = String(project);
-    const session = await sessionStore.getSession(projectStr);
+    const session = await resolveSession(projectStr);
 
     if (!session) {
       return `ArcRift project ID "${projectStr}" not found. Use list_projects to see valid IDs.`;
     }
 
-    const triples = await graphStore.getTriplesBySession(projectStr);
+    // Resolved ID — the caller may have passed a project name.
+    const sessionId = session._id;
+
+    const triples = await graphStore.getTriplesBySession(sessionId);
 
     let summary = session.summary || "No summary generated yet. Save a chat with the ArcRift extension to build knowledge.";
     

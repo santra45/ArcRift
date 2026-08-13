@@ -7,6 +7,7 @@
 import { vectorStore, sessionStore, graphStore } from "../../services/storage";
 import { extractEntitiesFromQuery } from "../../services/extractor";
 import { sanitizeChunks } from "../../middleware/sanitize";
+import { resolveSession } from "./resolve";
 
 export async function recall(
   query: string,
@@ -16,25 +17,28 @@ export async function recall(
 ): Promise<string> {
   try {
     const projectStr = String(project);
-    const session = await sessionStore.getSession(projectStr);
+    const session = await resolveSession(projectStr);
     
     if (!session) {
       return `ArcRift project ID "${projectStr}" not found. Use list_projects to see valid IDs.`;
     }
+
+    // Resolved ID — the caller may have passed a project name.
+    const sessionId = session._id;
 
     // 1. Graph Enrichment (Extract entities -> find related triples)
     let relatedTriples: any[] = [];
     try {
       const entities = await extractEntitiesFromQuery(query);
       if (entities.length > 0) {
-        relatedTriples = await graphStore.findRelatedTriples(entities, projectStr);
+        relatedTriples = await graphStore.findRelatedTriples(entities, sessionId);
       }
     } catch (err) {
       // Fallback: extraction failed, continue with vector only
     }
 
     // 2. Vector Retrieval
-    const chunks = await vectorStore.retrieveRelevantChunks(query, projectStr, topN);
+    const chunks = await vectorStore.retrieveRelevantChunks(query, sessionId, topN);
 
     if (chunks.length === 0 && relatedTriples.length === 0) {
       return `No relevant memory found for "${query}" in project "${session.projectName}".`;

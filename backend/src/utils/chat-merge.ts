@@ -23,10 +23,18 @@
 export function splitTurns(text: string): string[] {
   const trimmed = (text || "").trim();
   if (!trimmed) return [];
-  return trimmed
-    .split(/\n{2,}(?=\[(?:User|Assistant)\]:)/)
-    .map(t => t.trim())
-    .filter(Boolean);
+
+  // A transcript splits only ahead of a turn marker, so blank lines inside a
+  // single message do not break it apart. Text without markers — notes stored
+  // through store_memory — splits on blank lines instead; treating the whole
+  // note as one block made merging all-or-nothing, so re-storing part of an
+  // existing note appended a second copy rather than matching it.
+  const hasTurnMarkers = /^\[(?:User|Assistant)\]:/m.test(trimmed);
+  const parts = hasTurnMarkers
+    ? trimmed.split(/\n{2,}(?=\[(?:User|Assistant)\]:)/)
+    : trimmed.split(/\n{2,}/);
+
+  return parts.map(t => t.trim()).filter(Boolean);
 }
 
 /**

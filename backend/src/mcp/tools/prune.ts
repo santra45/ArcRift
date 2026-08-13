@@ -7,6 +7,7 @@
 import { sessionStore, graphStore, vectorStore } from "../../services/storage";
 import { extractTriples } from "../../services/extractor";
 import { logger } from "../../utils/logger";
+import { resolveSession } from "./resolve";
 
 export async function prune(
   prompt: string,
@@ -14,7 +15,7 @@ export async function prune(
 ): Promise<string> {
   try {
     const sessionId = String(project);
-    const session = await sessionStore.getSession(sessionId);
+    const session = await resolveSession(sessionId);
 
     if (!session) {
       return `Project "${sessionId}" not found.`;
@@ -38,13 +39,13 @@ export async function prune(
     }
 
     // 2. Wipe from Knowledge Graph
-    const factsDeleted = await graphStore.deleteTriples(entitiesToPrune, sessionId);
+    const factsDeleted = await graphStore.deleteTriples(entitiesToPrune, session._id);
 
     // 3. Wipe from Vector Store (Semantic)
-    const chunksDeleted = await vectorStore.deleteChunksByQuery(prompt, sessionId);
+    const chunksDeleted = await vectorStore.deleteChunksByQuery(prompt, session._id);
 
     // 4. Update Session Stats
-    await sessionStore.updateSession(sessionId, {
+    await sessionStore.updateSession(session._id, {
       tripleCount: Math.max(0, (session.tripleCount || 0) - factsDeleted),
       updatedAt: new Date()
     });
