@@ -65,16 +65,22 @@ export class SqliteVectorStore implements IVectorStore {
     if (chunks.length === 0) return;
 
     const sessionId = chunks[0].sessionId;
+
+    // nomic-embed-text: Use 'document' task for indexing.
+    // Embedded once — this used to run twice over identical input, doubling the
+    // slowest step of every save.
+    //
+    // Embedding runs before anything is deleted. This call reaches the
+    // embedding backend and can fail; deleting first meant a failure here left
+    // the session with no chunks at all, silently unsearchable until the next
+    // successful save.
+    const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
+
     await this.deleteChunksBySession(sessionId);
 
     const insertVec = this.db.prepare("INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
     const insertMeta = this.db.prepare("INSERT OR REPLACE INTO chunk_metadata (chunk_id, sessionId, chunkIndex, content, filePath, fileHash) VALUES (?, ?, ?, ?, ?, ?)");
     const insertFts = this.db.prepare("INSERT OR REPLACE INTO fts_chunks (chunk_id, content) VALUES (?, ?)");
-
-    // nomic-embed-text: Use 'document' task for indexing.
-    // Embedded once — this used to run twice over identical input, doubling the
-    // slowest step of every save.
-    const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
@@ -100,11 +106,14 @@ export class SqliteVectorStore implements IVectorStore {
     
     const filePath = chunks[0].filePath;
     const sessionId = chunks[0].sessionId;
+
+    // Embed before deleting, so a failed embedding call cannot leave the file
+    // with no chunks indexed.
+    const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
+
     if (filePath) {
       await this.deleteChunksByFile(filePath, sessionId);
     }
-
-    const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
 
     const insertVec = this.db.prepare("INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
     const insertMeta = this.db.prepare("INSERT OR REPLACE INTO chunk_metadata (chunk_id, sessionId, chunkIndex, content, filePath, fileHash) VALUES (?, ?, ?, ?, ?, ?)");

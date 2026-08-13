@@ -50,6 +50,11 @@ export async function storeWindowChunks(chunks: WindowChunk[]): Promise<void> {
   }
   if (chunks.length === 0) return;
 
+  // Embed chunks in parallel.
+  // Done before the purge below: embedding can fail, and purging first left the
+  // session with no vectors at all when it did.
+  const embeddings = await generateEmbeddings(chunks.map(c => c.content));
+
   // Purge ALL existing vectors for this session before storing new ones. Updated: v1.4.7
   // The previous approach only deleted chunk IDs matching the NEW set — if the
   // conversation shrank and produced fewer chunks, the old extra vectors
@@ -57,9 +62,6 @@ export async function storeWindowChunks(chunks: WindowChunk[]): Promise<void> {
   if (chunks[0]?.sessionId) {
     await deleteChunksBySession(chunks[0].sessionId);
   }
-
-  // Embed chunks in parallel
-  const embeddings = await generateEmbeddings(chunks.map(c => c.content));
 
   await axios.post(`${COLL_BASE}/${collectionId}/add`, {
     ids: chunks.map(c => c.id),
