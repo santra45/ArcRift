@@ -67,16 +67,13 @@ export class SqliteVectorStore implements IVectorStore {
     const sessionId = chunks[0].sessionId;
     await this.deleteChunksBySession(sessionId);
 
-    const contents = chunks.map(c => c.content);
-    // nomic-embed-text: Use 'document' task for indexing
-    const embeddings = await generateEmbeddings(contents, "document");
-
     const insertVec = this.db.prepare("INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
     const insertMeta = this.db.prepare("INSERT OR REPLACE INTO chunk_metadata (chunk_id, sessionId, chunkIndex, content, filePath, fileHash) VALUES (?, ?, ?, ?, ?, ?)");
     const insertFts = this.db.prepare("INSERT OR REPLACE INTO fts_chunks (chunk_id, content) VALUES (?, ?)");
-    const insertSentVec = this.db.prepare("INSERT OR REPLACE INTO vec_sentences (sentence_id, embedding) VALUES (?, ?)");
-    const insertSentMeta = this.db.prepare("INSERT OR REPLACE INTO sentence_metadata (sentence_id, chunk_id, content) VALUES (?, ?, ?)");
 
+    // nomic-embed-text: Use 'document' task for indexing.
+    // Embedded once — this used to run twice over identical input, doubling the
+    // slowest step of every save.
     const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
 
     for (let i = 0; i < chunks.length; i++) {
