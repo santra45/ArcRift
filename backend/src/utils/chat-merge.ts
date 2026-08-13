@@ -29,6 +29,16 @@ export function splitTurns(text: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Comparison key for a turn.
+ *
+ * Whitespace-insensitive, so the same turn still matches across changes to how
+ * the extension lifts text out of the page. Without this, a formatting fix on
+ * the capture side makes every stored turn look new and the whole conversation
+ * gets appended a second time.
+ */
+const turnKey = (turn: string) => turn.replace(/\s+/g, "");
+
 const sameSequence = (a: string[], b: string[]) =>
   a.length === b.length && a.every((turn, i) => turn === b[i]);
 
@@ -57,16 +67,20 @@ export function mergeChatText(
   if (next.length === 0) return { merged: previous.join("\n\n"), added: "" };
   if (previous.length === 0) return { merged: next.join("\n\n"), added: next.join("\n\n") };
 
-  const seen = new Set(previous);
-  if (next.every(turn => seen.has(turn))) {
+  const previousKeys = previous.map(turnKey);
+  const nextKeys = next.map(turnKey);
+  const seen = new Set(previousKeys);
+
+  if (nextKeys.every(key => seen.has(key))) {
     // Whole capture is already stored — a re-send after a page reload.
     return { merged: previous.join("\n\n"), added: "" };
   }
 
   // The capture contains the whole stored run — what a full-thread save looks
-  // like once the scraper walks the entire conversation. It supersedes.
-  if (indexOfRun(next, previous) !== -1) {
-    const fresh = next.filter(turn => !seen.has(turn));
+  // like once the scraper walks the entire conversation. It supersedes, which
+  // also lets a re-capture replace turns stored with worse formatting.
+  if (indexOfRun(nextKeys, previousKeys) !== -1) {
+    const fresh = next.filter((_, i) => !seen.has(nextKeys[i]));
     return { merged: next.join("\n\n"), added: fresh.join("\n\n") };
   }
 
@@ -75,7 +89,7 @@ export function mergeChatText(
   // The capture continues the stored transcript: its opening turns repeat the
   // stored tail. Keep everything past the overlap.
   for (let overlap = maxOverlap; overlap > 0; overlap--) {
-    if (sameSequence(previous.slice(previous.length - overlap), next.slice(0, overlap))) {
+    if (sameSequence(previousKeys.slice(previousKeys.length - overlap), nextKeys.slice(0, overlap))) {
       const tail = next.slice(overlap);
       return { merged: [...previous, ...tail].join("\n\n"), added: tail.join("\n\n") };
     }
@@ -84,7 +98,7 @@ export function mergeChatText(
   // The capture precedes the stored transcript: its closing turns repeat the
   // stored head. This is what a scrolled-up save looks like.
   for (let overlap = maxOverlap; overlap > 0; overlap--) {
-    if (sameSequence(next.slice(next.length - overlap), previous.slice(0, overlap))) {
+    if (sameSequence(nextKeys.slice(nextKeys.length - overlap), previousKeys.slice(0, overlap))) {
       const head = next.slice(0, next.length - overlap);
       return { merged: [...head, ...previous].join("\n\n"), added: head.join("\n\n") };
     }
@@ -92,6 +106,6 @@ export function mergeChatText(
 
   // No contiguous overlap. Order between the two runs is unknowable, so append
   // the unseen turns — incomplete ordering beats dropping them.
-  const fresh = next.filter(turn => !seen.has(turn));
+  const fresh = next.filter((_, i) => !seen.has(nextKeys[i]));
   return { merged: [...previous, ...fresh].join("\n\n"), added: fresh.join("\n\n") };
 }

@@ -87,6 +87,57 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 type Turn = { role: "user" | "assistant"; text: string };
 
+const BLOCK_TAGS = new Set([
+  "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "BR", "DD", "DIV", "DL", "DT",
+  "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER", "FORM", "H1", "H2", "H3", "H4",
+  "H5", "H6", "HEADER", "HR", "LI", "MAIN", "NAV", "OL", "P", "PRE", "SECTION",
+  "TABLE", "TD", "TFOOT", "TH", "THEAD", "TR", "UL",
+]);
+const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+
+/**
+ * Element text with block boundaries preserved.
+ *
+ * textContent concatenates children with no separator, so a heading runs
+ * straight into the paragraph after it — "...Best Subreddits for New
+ * AccountsThese subreddits...". That corrupts the stored transcript and the
+ * embeddings built from it. Indentation is left alone so pasted code survives.
+ */
+function extractText(el: Element): string {
+  const parts: string[] = [];
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.nodeValue || "");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = (node as Element).tagName;
+    if (SKIP_TAGS.has(tag)) return;
+    const isBlock = BLOCK_TAGS.has(tag);
+    if (isBlock) parts.push("\n");
+    for (const child of Array.from(node.childNodes)) walk(child);
+    if (isBlock) parts.push("\n");
+  };
+  walk(el);
+  return parts
+    .join("")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Keep only the innermost matches.
+ *
+ * Platform selector lists read as fallback chains ("try the container, else the
+ * content wrapper") but queryAll unions them, so an outer turn container and
+ * the inner wrapper it holds both match and the same reply is captured twice.
+ * The inner wrapper is the content; the outer adds copy/retry chrome.
+ */
+function dropNested(els: Element[]): Element[] {
+  return els.filter(el => !els.some(other => other !== el && el.contains(other)));
+}
+
 /**
  * Nearest scrollable ancestor of a message, or the document scroller.
  * Returns null when nothing scrolls — the thread already fits on screen.
@@ -154,8 +205,8 @@ function scrapeRenderedTurns(): Turn[] {
   }
 
   const tagged = [
-    ...userEls.map(el => ({ el, role: "user" as const })),
-    ...assistantEls.map(el => ({ el, role: "assistant" as const })),
+    ...dropNested(userEls).map(el => ({ el, role: "user" as const })),
+    ...dropNested(assistantEls).map(el => ({ el, role: "assistant" as const })),
   ];
   tagged.sort((a, b) => {
     const pos = a.el.compareDocumentPosition(b.el);
@@ -164,7 +215,7 @@ function scrapeRenderedTurns(): Turn[] {
 
   const turns: Turn[] = [];
   for (const { el, role } of tagged) {
-    let text = el.textContent?.trim() || "";
+    let text = extractText(el);
     if (text.length < 3) continue;
     // Strip platform-injected prefixes (Gemini wraps messages with "You said" / "Gemini said")
     text = text
