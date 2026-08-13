@@ -8,6 +8,7 @@ import { sessionStore, graphStore, vectorStore } from "../../services/storage";
 import { extractTriples } from "../../services/extractor";
 import { slidingWindowChunks } from "../../services/chunker";
 import { logger } from "../../utils/logger";
+import { mergeChatText, splitTurns } from "../../utils/chat-merge";
 
 export async function store(
   content: string,
@@ -35,7 +36,16 @@ export async function store(
     logger.info(`[ArcRift MCP] Using Session ID: "${sessionId}" for project: "${projectStr}"`);
 
     // 1. Save Full Chat (for Dashboard visualization)
-    await sessionStore.saveFullChat(sessionId, content, 1, "mcp");
+    // Merge into what is already stored — saving the raw content would replace
+    // every memory previously stored against this project.
+    const existingChat = await sessionStore.getFullChat(sessionId);
+    const { merged, added } = mergeChatText(existingChat?.rawText || "", content);
+
+    if (!added) {
+      return `That memory is already stored in project "${session.projectName}" (${sessionId}). Nothing to add.`;
+    }
+
+    await sessionStore.saveFullChat(sessionId, merged, splitTurns(merged).length, "mcp");
 
     // 2. Graph Extraction (with fallback)
     let triples: any[] = [];
@@ -54,7 +64,9 @@ export async function store(
     }
 
     // 3. Vector Storage (Batched)
-    const chunks = slidingWindowChunks(content, sessionId, 150, 50);
+    // Chunk the merged transcript: storeChunks replaces the session's chunks,
+    // so chunking only the new content would drop the earlier memories.
+    const chunks = slidingWindowChunks(merged, sessionId, 150, 50);
     await vectorStore.storeChunks(chunks);
 
     // 4. Update Stats

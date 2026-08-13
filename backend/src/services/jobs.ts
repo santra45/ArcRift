@@ -11,6 +11,7 @@ import { sessionStore, graphStore, vectorStore } from "./storage";
 import { generateEmbeddings } from "./embeddings";
 import { extractTriples, Triple, chunkText, summarizeChunk, extractTriplesFromSummary, extractTriplesFromText } from "./extractor";
 import { logger } from "../utils/logger";
+import { mergeChatText, splitTurns } from "../utils/chat-merge";
 
 /**
  * Add a new job to the queue.
@@ -318,20 +319,34 @@ async function handleChatIngestion(jobId: string, payload: {
   logger.info(`[Job Queue] Starting ingestion for session ${sessionId}...`);
 
   const cleanText = rawText; // PII scrubbed in route or here? We'll do it here to be safe.
-  const windowChunks = slidingWindowChunks(cleanText, sessionId);
+
+  // A save carries only the turns the extension has not sent before, so this
+  // merges into what is stored rather than replacing it — otherwise the second
+  // save of a conversation drops everything before it.
+  const existing = await sessionStore.getFullChat(sessionId);
+  const { merged, added } = mergeChatText(existing?.rawText || "", cleanText);
+
+  if (!added) {
+    logger.info(`[Job Queue] Nothing new to ingest for ${sessionId} — already stored.`);
+    return;
+  }
+
+  const windowChunks = slidingWindowChunks(merged, sessionId);
 
   // 1. Save FullChat metadata
-  await sessionStore.saveFullChat(sessionId, cleanText, messageCount, platform);
+  await sessionStore.saveFullChat(sessionId, merged, splitTurns(merged).length || messageCount, platform);
 
   // 2. Vector Storage (Sync within the background job)
+  // storeChunks replaces the session's chunks, which is correct here because
+  // windowChunks covers the whole merged transcript, not just the new turns.
   logger.info(`[Job Queue]   Embedding ${windowChunks.length} chunks...`);
   await vectorStore.storeChunks(windowChunks);
 
-  // 3. Chain into Triple Extraction
+  // 3. Chain into Triple Extraction — only over the new turns, since facts
+  //    already extracted from the stored text are still in the graph.
   await enqueueJob("triple_extraction", {
     sessionId,
-    text: cleanText,
-    windowChunks: windowChunks.length > 10 ? windowChunks : undefined,
+    text: added,
     processVectors: false // Already done
   });
 
