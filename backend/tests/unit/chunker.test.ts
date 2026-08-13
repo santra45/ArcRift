@@ -112,6 +112,69 @@ describe("slidingWindowChunks — zero data loss", () => {
   });
 });
 
+// ── Topic boundaries ───────────────────────────────────────────────
+
+describe("slidingWindowChunks — topic boundaries", () => {
+  // Four self-contained turns, each ~40 words, so two fit per 100-word window.
+  const turn = (label: string, filler: string) =>
+    `[${label}]: ${Array(38).fill(filler).join(" ")}`;
+  const transcript = [
+    turn("User", "alpha"),
+    turn("Assistant", "bravo"),
+    turn("User", "charlie"),
+    turn("Assistant", "delta"),
+  ].join("\n\n");
+
+  test("chunks start on a turn boundary, not mid-sentence", () => {
+    const chunks = slidingWindowChunks(transcript, SESSION, 100, 10);
+    chunks.forEach(c => {
+      expect(c.content.trimStart()).toMatch(/^\[(User|Assistant)\]:/);
+    });
+  });
+
+  test("a turn is never split across chunks", () => {
+    const chunks = slidingWindowChunks(transcript, SESSION, 100, 10);
+    // Each filler word belongs to exactly one turn. If a turn were split, some
+    // chunk would contain that filler without the turn's opening marker.
+    for (const [label, filler] of [["User", "alpha"], ["Assistant", "bravo"], ["User", "charlie"], ["Assistant", "delta"]] as const) {
+      for (const c of chunks) {
+        if (c.content.includes(filler)) {
+          expect(c.content).toContain(`[${label}]: ${filler}`);
+        }
+      }
+    }
+  });
+
+  test("blank-line separation survives into chunk content", () => {
+    const chunks = slidingWindowChunks(transcript, SESSION, 100, 10);
+    const multiTurn = chunks.find(c => (c.content.match(/\[(User|Assistant)\]:/g) || []).length > 1);
+    expect(multiTurn?.content).toContain("\n\n");
+  });
+
+  test("no words are lost across topic-aware chunks", () => {
+    const chunks = slidingWindowChunks(transcript, SESSION, 100, 10);
+    const combined = chunks.map(c => c.content).join(" ");
+    for (const filler of ["alpha", "bravo", "charlie", "delta"]) {
+      expect(combined).toContain(filler);
+    }
+  });
+
+  test("a single oversized block is still split rather than dropped", () => {
+    const huge = Array(250).fill("solo").join(" ");
+    const text = `[User]: short opener\n\n${huge}`;
+    const chunks = slidingWindowChunks(text, SESSION, 100, 20);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.map(c => c.content).join(" ")).toContain("short opener");
+  });
+
+  test("unstructured text keeps the plain sliding-window behaviour", () => {
+    const flat = Array.from({ length: 400 }, (_, i) => `w${i}`).join(" ");
+    const chunks = slidingWindowChunks(flat, SESSION, 100, 20);
+    const step = 100 - 20;
+    chunks.forEach((c, i) => expect(c.wordStart).toBe(i * step));
+  });
+});
+
 // ── Custom parameters ──────────────────────────────────────────────
 
 describe("slidingWindowChunks — custom parameters", () => {
