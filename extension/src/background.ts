@@ -74,6 +74,9 @@ chrome.runtime.onMessage.addListener((message: ArcRiftMessage, _sender, sendResp
     case "LIST_SESSIONS":
       handleListSessions().then(sendResponse);
       return true;
+    case "SELECT_SESSION":
+      handleSelectSession(message.payload.sessionId).then(sendResponse);
+      return true;
     case "SET_ACTIVE_SESSION":
       handleSetActiveSession(message.payload.sessionId).then(sendResponse);
       return true;
@@ -218,6 +221,39 @@ async function handleListSessions() {
     return { sessions: Array.isArray(data.sessions) ? data.sessions : [] };
   } catch {
     return { sessions: [] };
+  }
+}
+
+/**
+ * Make an existing session the active one.
+ *
+ * Picking in the popup has to do everything a save does apart from writing the
+ * chat: mark it active, cache it, and broadcast it. Content scripts keep their
+ * own sessionId and only learn about changes through SESSION_CHANGED, so
+ * without the broadcast Inject Context still reports no session loaded.
+ */
+async function handleSelectSession(sessionId: string) {
+  try {
+    const res = await arcriftFetch("/api/context/sessions");
+    const data = res.ok ? await res.json() : { sessions: [] };
+    const session = (data.sessions || []).find((s: any) => String(s._id) === String(sessionId));
+    if (!session) return { error: "Session not found" };
+
+    const sessionData = {
+      sessionId: session._id,
+      projectName: session.projectName,
+      tripleCount: session.tripleCount ?? 0,
+      topicCount: session.topicCount ?? 0,
+      platform: session.platform,
+    };
+
+    await chrome.storage.local.set({ ARCRIFT_session: sessionData });
+    await handleSetActiveSession(session._id).catch(() => { });
+    broadcastSessionChanged(session._id, session.projectName);
+
+    return { ok: true, session: sessionData };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "Failed to select session" };
   }
 }
 

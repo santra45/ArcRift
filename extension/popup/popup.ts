@@ -442,16 +442,32 @@ function populateSessionPicker() {
 sessionPicker.addEventListener("change", () => {
   pickedSessionId = sessionPicker.value || undefined;
 
-  if (pickedSessionId) {
-    // Mirror the name across so the backend's rename check sees the session's
-    // own name rather than treating it as a clash with another project.
-    const label = sessionPicker.options[sessionPicker.selectedIndex]?.textContent || "";
-    projectNameInput.value = label.split(" — ")[0];
-    setStatus("Saving into the selected session.");
-  } else {
+  if (!pickedSessionId) {
     projectNameInput.value = "";
     setStatus("");
+    return;
   }
+
+  // Picking has to activate the session, not just remember it. Inject Context
+  // and the prompt interceptor read the content script's own sessionId, which
+  // only updates when the background broadcasts a session change.
+  const label = sessionPicker.options[sessionPicker.selectedIndex]?.textContent || "";
+  const chosenName = label.split(" — ")[0];
+  setStatus("Loading session...");
+
+  chrome.runtime.sendMessage({ type: "SELECT_SESSION", payload: { sessionId: pickedSessionId } }, (response) => {
+    if (chrome.runtime.lastError || response?.error) {
+      setStatus(`⚠ ${response?.error || "Could not load session"}`, "error");
+      return;
+    }
+
+    currentSessionId = pickedSessionId!;
+    showSession(response.session as SessionData);
+    // showSession clears the name field; restore it so the backend's rename
+    // check compares the session against itself instead of flagging a clash.
+    projectNameInput.value = chosenName;
+    setStatus(`Loaded "${chosenName}" — saves and injection use it now.`);
+  });
 });
 
 unloadBtn.addEventListener("click", async () => {

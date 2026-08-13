@@ -13,6 +13,7 @@ export type ArcRiftMessage =
   | { type: "GET_SESSION" }
   | { type: "GET_ACTIVE_SESSION" }
   | { type: "LIST_SESSIONS" }
+  | { type: "SELECT_SESSION"; payload: { sessionId: string } }
   | { type: "SET_ACTIVE_SESSION"; payload: { sessionId: string | null } }
   | { type: "GET_PAUSE_STATE" }
   | { type: "SET_PAUSE_STATE"; payload: { paused: boolean } }
