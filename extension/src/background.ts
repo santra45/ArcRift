@@ -142,7 +142,10 @@ async function handleRAGRetrieve(payload: {
       body: JSON.stringify({
         prompt: payload.prompt,
         sessionId: payload.sessionId,
-        topN: payload.topN ?? 3,  // default 3 — sliding window chunks need more context
+        // Omitted unless explicitly set: the backend used to ignore topN and
+        // always retrieve 10, so sending 3 now that it is honoured would cut
+        // injected context to a third of what it has been.
+        ...(payload.topN ? { topN: payload.topN } : {}),
       }),
     });
     if (!res.ok) {

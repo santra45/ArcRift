@@ -9,11 +9,64 @@ import { isValidObjectId } from "../utils/validators";
 import { getSettings } from "../utils/settings";
 import { RAG_RELEVANCE_THRESHOLD } from "../utils/constants";
 
+/** Caller-supplied topN, clamped. Falls back to the route's own default. */
+function resolveChunkLimit(topN: unknown, fallback: number): number {
+  const requested = Math.floor(Number(topN));
+  if (!Number.isFinite(requested) || requested < 1) return fallback;
+  return Math.min(requested, 25);
+}
+
+/**
+ * Assemble the context block inside a character budget.
+ *
+ * Graph facts and the wrapper are part of what gets injected, so they are
+ * measured too. Budgeting the chunk text alone let the delivered block run over
+ * — 6544 characters against a 6000 budget, in a case with 12 facts attached.
+ *
+ * Chunks are dropped from the end until the whole assembled block fits, rather
+ * than stopping at the first chunk that does not fit, so a single large result
+ * no longer ends the fill with budget to spare.
+ */
+function buildBudgetedContext(
+  chunks: RetrievedChunk[],
+  facts: any[],
+  maxChars: number
+): { block: string; used: RetrievedChunk[] } {
+  let factsText = facts.map(t => `- ${t.subject} ${t.relation} ${t.object}`).join("\n");
+
+  // Facts must never crowd out retrieved text entirely.
+  const factsCap = Math.floor(maxChars / 2);
+  if (factsText.length > factsCap) factsText = factsText.slice(0, factsCap) + "\n...";
+
+  const assemble = (list: RetrievedChunk[]) => {
+    const wrapped = wrapInContextBlock(list);
+    return factsText
+      ? `RELATED KNOWLEDGE:\n${factsText}\n\nRETRIEVED CONTEXT:\n${wrapped}`
+      : wrapped;
+  };
+
+  const used = [...chunks];
+  while (used.length > 1 && assemble(used).length > maxChars) used.pop();
+
+  // A lone chunk that still overflows is trimmed rather than dropped, so a long
+  // first result does not leave the caller with nothing.
+  if (used.length === 1) {
+    const over = assemble(used).length - maxChars;
+    if (over > 0) {
+      const suffix = "\n... (truncated for budget)";
+      const keep = Math.max(0, used[0].content.length - over - suffix.length);
+      used[0] = { ...used[0], content: used[0].content.slice(0, keep) + suffix };
+    }
+  }
+
+  return { block: assemble(used), used };
+}
+
 const router = Router();
 
 // POST /api/rag/retrieve
 router.post("/retrieve", async (req: Request, res: Response) => {
-  let { prompt, sessionId, topN = 3 } = req.body;
+  let { prompt, sessionId, topN } = req.body;
 
   if (!prompt || !sessionId) {
     res.status(400).json({ error: "prompt and sessionId are required" });
@@ -29,6 +82,8 @@ router.post("/retrieve", async (req: Request, res: Response) => {
   // v1.4.6: Character-based context budgeting
   // We retrieve a larger pool and fill until the budget is reached.
   const MAX_TOTAL_CHARS = 6000;
+  // 10 preserves the pool this route used before topN was honoured.
+  const maxChunks = resolveChunkLimit(topN, 10);
 
   try {
     logger.info(`RAG retrieve (budget=${MAX_TOTAL_CHARS} chars): "${String(prompt).slice(0, 60)}..." for session ${sessionId}`);
@@ -41,7 +96,7 @@ router.post("/retrieve", async (req: Request, res: Response) => {
     }
 
     // Retrieve a larger candidate pool for budgeting with Keyword Boosting
-    const rawCandidateChunks = await vectorStore.retrieveRelevantChunks(prompt, sessionId, 10, entities);
+    const rawCandidateChunks = await vectorStore.retrieveRelevantChunks(prompt, sessionId, maxChunks, entities);
 
     // v1.6.3: Filter out low-relevance chunks to prevent hallucination
     const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RAG_RELEVANCE_THRESHOLD);
@@ -51,40 +106,20 @@ router.post("/retrieve", async (req: Request, res: Response) => {
       return;
     }
 
-    // Fill budget
-    const safeChunks: RetrievedChunk[] = [];
-    let currentChars = 0;
-
-    for (const chunk of candidateChunks) {
-      if (currentChars + chunk.content.length > MAX_TOTAL_CHARS) {
-        // If the very first chunk is huge, truncate it
-        if (safeChunks.length === 0) {
-          const truncated = chunk.content.slice(0, MAX_TOTAL_CHARS);
-          safeChunks.push({ ...chunk, content: truncated + "\n... (truncated for budget)" });
-        }
-        break;
-      }
-      safeChunks.push(chunk);
-      currentChars += chunk.content.length;
-    }
-
-    // Sanitise (redact injection patterns) then wrap in XML delimiters
-    const sanitized = sanitizeChunks(safeChunks);
+    // Sanitise (redact injection patterns) before budgeting, so the measurement
+    // matches what actually gets delivered.
+    const sanitizedCandidates = sanitizeChunks(candidateChunks);
+    const { block, used } = buildBudgetedContext(sanitizedCandidates, relatedTriples, MAX_TOTAL_CHARS);
+    const sanitized = used;
 
     // v1.4.4 style: inject raw chunks directly (no LLM extraction step)
-    let contextBlockRaw = "";
-    
+    let contextBlockRaw = block;
+
     if (getSettings().contextMode === "summarized") {
       const chunksContent = sanitized.map(c => c.content);
       const factsContent = relatedTriples.map(t => `- ${t.subject} ${t.relation} ${t.object}`);
       const summary = await summarizeContext(String(prompt), chunksContent, factsContent);
       contextBlockRaw = `SUMMARIZED CONTEXT:\n${summary}`;
-    } else {
-      contextBlockRaw = wrapInContextBlock(sanitized);
-      if (relatedTriples.length > 0) {
-        const graphText = relatedTriples.map(t => `- ${t.subject} ${t.relation} ${t.object}`).join("\n");
-        contextBlockRaw = `RELATED KNOWLEDGE:\n${graphText}\n\nRETRIEVED CONTEXT:\n${contextBlockRaw}`;
-      }
     }
 
     const contextBlock = contextBlockRaw.trim();
@@ -118,7 +153,7 @@ router.post("/retrieve", async (req: Request, res: Response) => {
       logger.warn(`Failed to update session analytics: ${analyticsErr}`);
     }
 
-    logger.success(`RAG: Budget filled (${currentChars}/${MAX_TOTAL_CHARS} chars). ${sanitized.length} chunks used.`);
+    logger.success(`RAG: Budget filled (${contextBlock.length}/${MAX_TOTAL_CHARS} chars). ${sanitized.length} chunks used.`);
 
     res.json({
       found: true,
@@ -136,7 +171,7 @@ router.post("/retrieve", async (req: Request, res: Response) => {
 
 // POST /api/rag/global — search across ALL sessions
 router.post("/global", async (req: Request, res: Response) => {
-  let { prompt, topN = 3 } = req.body;
+  let { prompt, topN } = req.body;
 
   if (!prompt) {
     res.status(400).json({ error: "prompt is required" });
@@ -145,6 +180,8 @@ router.post("/global", async (req: Request, res: Response) => {
 
   // v1.4.6: Character-based context budgeting
   const MAX_TOTAL_CHARS = 4000; // Lower for global to avoid noisy context
+  // 8 preserves the pool this route used before topN was honoured.
+  const maxChunks = resolveChunkLimit(topN, 8);
 
   try {
     logger.info(`RAG Global (budget=${MAX_TOTAL_CHARS}): "${String(prompt).slice(0, 60)}..."`);
@@ -158,7 +195,7 @@ router.post("/global", async (req: Request, res: Response) => {
     }
 
     // Retrieve a larger candidate pool with Keyword Boosting
-    const rawCandidateChunks = await vectorStore.retrieveGlobalChunks(prompt, 8, entities);
+    const rawCandidateChunks = await vectorStore.retrieveGlobalChunks(prompt, maxChunks, entities);
 
     // v1.6.3: Filter out low-relevance chunks to prevent hallucination
     const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RAG_RELEVANCE_THRESHOLD);
@@ -168,41 +205,27 @@ router.post("/global", async (req: Request, res: Response) => {
       return;
     }
 
-    // Fill budget
-    const safeChunks: RetrievedChunk[] = [];
-    let currentChars = 0;
+    const sanitizedCandidates = sanitizeChunks(candidateChunks);
+    const { block, used } = buildBudgetedContext(sanitizedCandidates, relatedTriples, MAX_TOTAL_CHARS);
+    const sanitized = used;
 
-    for (const chunk of candidateChunks) {
-      if (currentChars + chunk.content.length > MAX_TOTAL_CHARS) break;
-      safeChunks.push(chunk);
-      currentChars += chunk.content.length;
-    }
+    let contextBlockRaw = block;
 
-    const sanitized = sanitizeChunks(safeChunks);
-    
-    let contextBlockRaw = "";
-    
     if (getSettings().contextMode === "summarized") {
       const chunksContent = sanitized.map(c => c.content);
       const factsContent = relatedTriples.map(t => `- ${t.subject} ${t.relation} ${t.object}`);
       const summary = await summarizeContext(String(prompt), chunksContent, factsContent);
       contextBlockRaw = `SUMMARIZED CONTEXT:\n${summary}`;
-    } else {
-      contextBlockRaw = wrapInContextBlock(sanitized);
-      if (relatedTriples.length > 0) {
-        const graphText = relatedTriples.map(t => `- ${t.subject} ${t.relation} ${t.object}`).join("\n");
-        contextBlockRaw = `RELATED KNOWLEDGE:\n${graphText}\n\nRETRIEVED CONTEXT:\n${contextBlockRaw}`;
-      }
     }
-    
+
     const contextBlock = contextBlockRaw.trim();
-    
+
     if (!contextBlock) {
       res.json({ found: false, chunks: [], graphFacts: [] });
       return;
     }
 
-    logger.success(`RAG Global: Budget filled (${currentChars}/${MAX_TOTAL_CHARS} chars). ${sanitized.length} chunks used. ${relatedTriples.length} facts found.`);
+    logger.success(`RAG Global: Budget filled (${contextBlock.length}/${MAX_TOTAL_CHARS} chars). ${sanitized.length} chunks used. ${relatedTriples.length} facts found.`);
 
     res.json({
       found: true,
