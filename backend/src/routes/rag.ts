@@ -7,6 +7,7 @@ import { logger } from "../utils/logger";
 import { wrapInContextBlock, sanitizeChunks } from "../middleware/sanitize";
 import { isValidObjectId } from "../utils/validators";
 import { getSettings } from "../utils/settings";
+import { RAG_RELEVANCE_THRESHOLD } from "../utils/constants";
 
 const router = Router();
 
@@ -43,8 +44,7 @@ router.post("/retrieve", async (req: Request, res: Response) => {
     const rawCandidateChunks = await vectorStore.retrieveRelevantChunks(prompt, sessionId, 10, entities);
 
     // v1.6.3: Filter out low-relevance chunks to prevent hallucination
-    const RELEVANCE_THRESHOLD = 0.50;
-    const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RELEVANCE_THRESHOLD);
+    const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RAG_RELEVANCE_THRESHOLD);
 
     if (candidateChunks.length === 0 && relatedTriples.length === 0) {
       res.json({ found: false, chunks: [], graphFacts: [] });
@@ -161,8 +161,7 @@ router.post("/global", async (req: Request, res: Response) => {
     const rawCandidateChunks = await vectorStore.retrieveGlobalChunks(prompt, 8, entities);
 
     // v1.6.3: Filter out low-relevance chunks to prevent hallucination
-    const RELEVANCE_THRESHOLD = 0.50;
-    const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RELEVANCE_THRESHOLD);
+    const candidateChunks = rawCandidateChunks.filter(c => (c.score || 0) >= RAG_RELEVANCE_THRESHOLD);
 
     if (candidateChunks.length === 0 && relatedTriples.length === 0) {
       res.json({ found: false, chunks: [], graphFacts: [] });
