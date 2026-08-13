@@ -12,6 +12,7 @@ export type ArcRiftMessage =
   | { type: "CREATE_SESSION"; payload: { projectName: string; platform: Platform; sessionId?: string } }
   | { type: "GET_SESSION" }
   | { type: "GET_ACTIVE_SESSION" }
+  | { type: "LIST_SESSIONS" }
   | { type: "SET_ACTIVE_SESSION"; payload: { sessionId: string | null } }
   | { type: "GET_PAUSE_STATE" }
   | { type: "SET_PAUSE_STATE"; payload: { paused: boolean } }

@@ -71,6 +71,9 @@ chrome.runtime.onMessage.addListener((message: ArcRiftMessage, _sender, sendResp
     case "GET_ACTIVE_SESSION":
       handleGetActiveSession().then(sendResponse);
       return true;
+    case "LIST_SESSIONS":
+      handleListSessions().then(sendResponse);
+      return true;
     case "SET_ACTIVE_SESSION":
       handleSetActiveSession(message.payload.sessionId).then(sendResponse);
       return true;
@@ -200,6 +203,21 @@ async function handleGetActiveSession() {
     return data;
   } catch {
     return { activeSession: null };
+  }
+}
+
+/**
+ * Existing sessions, so the popup can attach this chat to one instead of only
+ * ever creating a new project.
+ */
+async function handleListSessions() {
+  try {
+    const res = await arcriftFetch("/api/context/sessions");
+    if (!res.ok) return { sessions: [] };
+    const data = await res.json();
+    return { sessions: Array.isArray(data.sessions) ? data.sessions : [] };
+  } catch {
+    return { sessions: [] };
   }
 }
 

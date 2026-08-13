@@ -24,6 +24,12 @@ const detectedPlatformEl = document.getElementById("detected-platform") as HTMLE
 const platformDot = document.getElementById("platform-dot") as HTMLElement;
 const arcriftStatusBadge = document.getElementById("ArcRift-status-badge") as HTMLElement;
 const projectNameInput = document.getElementById("project-name") as HTMLInputElement;
+const sessionPicker = document.getElementById("session-picker") as HTMLSelectElement;
+
+// Set when the user explicitly chooses an existing session to save into. This
+// overrides the URL mapping, which is what makes it possible to attach a fresh
+// browser chat to a project that already exists.
+let pickedSessionId: string | undefined;
 const selectorWarningEl = document.getElementById("selector-warning") as HTMLElement;
 const selectorWarningMsgEl = document.getElementById("selector-warning-msg") as HTMLElement;
 const selectorDismissBtn = document.getElementById("selector-dismiss-btn") as HTMLButtonElement;
@@ -195,6 +201,9 @@ async function ensureContentScript(tabId: number): Promise<boolean> {
   pauseToggleBtn.disabled = false; // Always allow pausing/resuming
   updatePauseUI();
 
+  // After the active session resolves, so the picker can preselect it.
+  populateSessionPicker();
+
   // Check for a pending selector failure from the last session
   chrome.runtime.sendMessage({ type: "GET_SELECTOR_STATE" }, (response) => {
     if (response?.failed) {
@@ -241,16 +250,26 @@ saveBtn.addEventListener("click", async () => {
     existingSessionId = urlMap[smartKey] || urlMap[tabUrl];
   }
 
-  // FIX: Prioritise currentSessionId if it exists to prevent duplicates
-  // BUT: Verify it belongs to this smartKey to prevent session hijacking across tabs
-  let sessionIdToUse = currentSessionId || existingSessionId;
-  if (sessionIdToUse && sessionIdToUse !== existingSessionId && existingSessionId) {
-    console.warn("[ArcRift popup] Session ID mismatch for this URL. Resetting to URL-mapped ID.");
-    sessionIdToUse = existingSessionId;
-  } else if (sessionIdToUse && !existingSessionId && currentSessionId) {
-    // We are on a new URL but the popup has an old session in memory
-    console.info("[ArcRift popup] New URL detected. Clearing stale session ID.");
-    sessionIdToUse = undefined;
+  let sessionIdToUse: string | undefined;
+
+  if (pickedSessionId) {
+    // An explicit choice beats the URL mapping — the guards below exist to stop
+    // a stale in-memory session leaking across tabs, but here the user asked for
+    // this session by name.
+    sessionIdToUse = pickedSessionId;
+    console.log(`[ArcRift popup] saving into chosen session: ${sessionIdToUse}`);
+  } else {
+    // FIX: Prioritise currentSessionId if it exists to prevent duplicates
+    // BUT: Verify it belongs to this smartKey to prevent session hijacking across tabs
+    sessionIdToUse = currentSessionId || existingSessionId;
+    if (sessionIdToUse && sessionIdToUse !== existingSessionId && existingSessionId) {
+      console.warn("[ArcRift popup] Session ID mismatch for this URL. Resetting to URL-mapped ID.");
+      sessionIdToUse = existingSessionId;
+    } else if (sessionIdToUse && !existingSessionId && currentSessionId) {
+      // We are on a new URL but the popup has an old session in memory
+      console.info("[ArcRift popup] New URL detected. Clearing stale session ID.");
+      sessionIdToUse = undefined;
+    }
   }
 
   if (sessionIdToUse) {
@@ -392,6 +411,49 @@ pauseToggleBtn.addEventListener("click", async () => {
 });
 
 // ── Unload Session ───────────────────────────────────────────────
+/**
+ * Fill the picker with existing sessions so a chat can be saved into one.
+ *
+ * Without this the only route is the name field, and a name that already exists
+ * is rejected by the backend as a duplicate — leaving no way to continue an
+ * existing project from a new browser chat.
+ */
+function populateSessionPicker() {
+  chrome.runtime.sendMessage({ type: "LIST_SESSIONS" }, (response) => {
+    if (chrome.runtime.lastError) return;
+    const sessions = (response?.sessions || []) as Array<{ _id: string; projectName: string; platform?: string }>;
+    if (sessions.length === 0) return;
+
+    for (const s of sessions) {
+      const option = document.createElement("option");
+      option.value = s._id;
+      option.textContent = s.platform ? `${s.projectName} — ${s.platform}` : s.projectName;
+      sessionPicker.appendChild(option);
+    }
+
+    // Preselect whatever this chat is already attached to.
+    if (currentSessionId && sessions.some(s => s._id === currentSessionId)) {
+      sessionPicker.value = currentSessionId;
+      pickedSessionId = currentSessionId;
+    }
+  });
+}
+
+sessionPicker.addEventListener("change", () => {
+  pickedSessionId = sessionPicker.value || undefined;
+
+  if (pickedSessionId) {
+    // Mirror the name across so the backend's rename check sees the session's
+    // own name rather than treating it as a clash with another project.
+    const label = sessionPicker.options[sessionPicker.selectedIndex]?.textContent || "";
+    projectNameInput.value = label.split(" — ")[0];
+    setStatus("Saving into the selected session.");
+  } else {
+    projectNameInput.value = "";
+    setStatus("");
+  }
+});
+
 unloadBtn.addEventListener("click", async () => {
   if (!currentSessionId) return;
 
