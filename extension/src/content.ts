@@ -60,10 +60,187 @@ function fingerprint(text: string): string { return fnv1a(text.trim()); }
 // Add a fingerprint, but cap the set at 1000 entries to prevent unbounded
 // memory growth during very long sessions where the user never re-saves.
 function addFingerprint(fp: string): void {
-  if (seenMessageFingerprints.size >= 1000) {
-    seenMessageFingerprints.clear();
+  if (seenMessageFingerprints.size >= 5000) {
+    // Drop the oldest entries rather than wiping the set. Clearing it made
+    // every previously-saved turn look new again on the next save, which
+    // matters now that a capture covers the whole thread rather than a screenful.
+    const drop = Math.floor(seenMessageFingerprints.size / 4);
+    let removed = 0;
+    for (const old of seenMessageFingerprints) {
+      if (removed++ >= drop) break;
+      seenMessageFingerprints.delete(old);
+    }
   }
   seenMessageFingerprints.add(fp);
+}
+
+// ── Full-transcript capture ──────────────────────────────────────
+// Platforms virtualise long threads: turns scrolled out of view are removed
+// from the DOM, so a plain querySelectorAll only ever sees the recent portion.
+// Capturing the whole conversation means scrolling it back into existence.
+
+const SCROLL_SETTLE_MS = 350;
+const SCROLL_MAX_STEPS = 300;
+const SCROLL_MAX_MS = 45_000;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+type Turn = { role: "user" | "assistant"; text: string };
+
+/**
+ * Nearest scrollable ancestor of a message, or the document scroller.
+ * Returns null when nothing scrolls — the thread already fits on screen.
+ */
+function findScrollContainer(from: Element | null): Element | null {
+  let node = from?.parentElement || null;
+  while (node && node !== document.body) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (/(auto|scroll|overlay)/.test(overflowY) && node.scrollHeight > node.clientHeight + 40) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  const doc = document.scrollingElement || document.documentElement;
+  return doc && doc.scrollHeight > doc.clientHeight + 40 ? doc : null;
+}
+
+/**
+ * Read the turns currently in the DOM, in document order. Ordering is only
+ * valid for rendered elements, which is why collection happens per scroll step
+ * rather than once at the end.
+ */
+function scrapeRenderedTurns(): Turn[] {
+  if (!config) return [];
+
+  let userEls = queryAll(config.userSelectors);
+  const assistantEls = queryAll(config.responseSelectors);
+
+  if (userEls.length === 0 && assistantEls.length > 0) {
+    const foundUserEls: Element[] = [];
+    for (const assistantEl of assistantEls) {
+      let parent = assistantEl.parentElement;
+      for (let depth = 0; depth < 5 && parent; depth++) {
+        const prev = parent.previousElementSibling;
+        if (prev) {
+          const prevText = prev.textContent?.trim() || "";
+          if (prevText.length > 2 && prevText.length < 5000 && !assistantEls.some(a => a === prev || a.contains(prev) || prev.contains(a))) {
+            foundUserEls.push(prev);
+            break;
+          }
+        }
+        parent = parent.parentElement;
+      }
+    }
+    if (foundUserEls.length > 0) userEls = foundUserEls;
+  }
+
+  if (userEls.length === 0) {
+    const broadSelectors = [
+      '[role="row"]',
+      '[data-turn-role="user"]',
+      '[aria-label*="You"]',
+      '[aria-label*="your prompt"]',
+      '[aria-label*="your message"]',
+    ];
+    for (const sel of broadSelectors) {
+      try {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+          userEls = Array.from(els);
+          break;
+        }
+      } catch { /* invalid selector */ }
+    }
+  }
+
+  const tagged = [
+    ...userEls.map(el => ({ el, role: "user" as const })),
+    ...assistantEls.map(el => ({ el, role: "assistant" as const })),
+  ];
+  tagged.sort((a, b) => {
+    const pos = a.el.compareDocumentPosition(b.el);
+    return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  });
+
+  const turns: Turn[] = [];
+  for (const { el, role } of tagged) {
+    let text = el.textContent?.trim() || "";
+    if (text.length < 3) continue;
+    // Strip platform-injected prefixes (Gemini wraps messages with "You said" / "Gemini said")
+    text = text
+      .replace(/^You said\s*/i, "")
+      .replace(/^Gemini said\s*/i, "")
+      .replace(/^ChatGPT said\s*/i, "")
+      .replace(/^Claude said\s*/i, "")
+      .replace(/^DeepSeek said\s*/i, "")
+      .trim();
+    if (text.length < 3) continue;
+    turns.push({ role, text });
+  }
+  return turns;
+}
+
+/**
+ * Scroll the thread from top to bottom, collecting turns as they render.
+ *
+ * Two passes: climb to the top so the platform pages in older turns, then walk
+ * back down collecting in order. Collecting on the way down keeps the result
+ * ordered — scrolling up would yield segments in reverse.
+ */
+async function collectFullTranscript(): Promise<{ turns: Turn[]; scrolled: boolean; timedOut: boolean }> {
+  const anchor = queryAll(config!.responseSelectors)[0] || queryAll(config!.userSelectors)[0] || null;
+  const scroller = findScrollContainer(anchor);
+
+  if (!scroller) {
+    log.info("[ArcRift] no scroll container — thread already fully rendered");
+    return { turns: scrapeRenderedTurns(), scrolled: false, timedOut: false };
+  }
+
+  const startedAt = Date.now();
+  const outOfTime = () => Date.now() - startedAt > SCROLL_MAX_MS;
+
+  const ordered: Turn[] = [];
+  const seenInPass = new Set<string>();
+  const absorb = () => {
+    for (const turn of scrapeRenderedTurns()) {
+      const fp = fingerprint(turn.text);
+      if (seenInPass.has(fp)) continue;
+      seenInPass.add(fp);
+      ordered.push(turn);
+    }
+  };
+
+  // Pass 1 — climb to the top, letting older turns page in.
+  let steps = 0;
+  while (steps++ < SCROLL_MAX_STEPS && !outOfTime()) {
+    const heightBefore = scroller.scrollHeight;
+    scroller.scrollTop = Math.max(0, scroller.scrollTop - scroller.clientHeight * 0.9);
+    await sleep(SCROLL_SETTLE_MS);
+    if (scroller.scrollTop <= 0 && scroller.scrollHeight === heightBefore) break;
+  }
+
+  // Pass 2 — walk back down, collecting in order.
+  scroller.scrollTop = 0;
+  await sleep(SCROLL_SETTLE_MS);
+  absorb();
+
+  steps = 0;
+  while (steps++ < SCROLL_MAX_STEPS && !outOfTime()) {
+    const topBefore = scroller.scrollTop;
+    scroller.scrollTop = topBefore + scroller.clientHeight * 0.8;
+    await sleep(SCROLL_SETTLE_MS);
+    absorb();
+    if (scroller.scrollTop <= topBefore) break; // already at the bottom
+  }
+
+  // One last look after the view settles, in case the tail rendered late.
+  await sleep(SCROLL_SETTLE_MS);
+  absorb();
+
+  const timedOut = outOfTime();
+  if (timedOut) log.warn("[ArcRift] transcript capture hit its time limit — saving what was collected");
+  log.info(`[ArcRift] collected ${ordered.length} turns across the full thread`);
+  return { turns: ordered, scrolled: true, timedOut };
 }
 
 // ── Boot ─────────────────────────────────────────────────────────
@@ -165,83 +342,28 @@ async function saveCurrentChat(projectName: string, providedSessionId?: string):
     return { success: false, topicsExtracted: 0, triplesExtracted: 0, error: "Unsupported platform" };
   }
 
-  let userEls = queryAll(config.userSelectors);
-  const assistantEls = queryAll(config.responseSelectors);
-  log.info(`[ArcRift] scrape: ${userEls.length} user els, ${assistantEls.length} assistant els (platform: ${platform})`);
-
-  if (userEls.length === 0 && assistantEls.length > 0) {
-    log.info("[ArcRift] user selectors returned 0 — trying structural fallback");
-    const foundUserEls: Element[] = [];
-    for (const assistantEl of assistantEls) {
-      let parent = assistantEl.parentElement;
-      for (let depth = 0; depth < 5 && parent; depth++) {
-        const prev = parent.previousElementSibling;
-        if (prev) {
-          const prevText = prev.textContent?.trim() || "";
-          if (prevText.length > 2 && prevText.length < 5000 && !assistantEls.some(a => a === prev || a.contains(prev) || prev.contains(a))) {
-            foundUserEls.push(prev);
-            break;
-          }
-        }
-        parent = parent.parentElement;
-      }
-    }
-    if (foundUserEls.length > 0) {
-      userEls = foundUserEls;
-      log.info(`[ArcRift] structural fallback found ${userEls.length} user element(s)`);
-    }
-  }
-
-  if (userEls.length === 0) {
-    const broadSelectors = [
-      '[role="row"]',
-      '[data-turn-role="user"]',
-      '[aria-label*="You"]',
-      '[aria-label*="your prompt"]',
-      '[aria-label*="your message"]',
-    ];
-    for (const sel of broadSelectors) {
-      try {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          userEls = Array.from(els);
-          log.info(`[ArcRift] broad selector "${sel}" found ${userEls.length} user element(s)`);
-          break;
-        }
-      } catch { /* invalid selector */ }
-    }
-  }
-
-  if (assistantEls.length === 0 && userEls.length === 0) {
+  if (scrapeRenderedTurns().length === 0) {
     return {
       success: false, topicsExtracted: 0, triplesExtracted: 0,
       error: `No messages found on ${platform}. Make sure you're on a chat page with visible messages.`,
     };
   }
 
-  type TaggedEl = { el: Element; role: "user" | "assistant" };
-  const tagged: TaggedEl[] = [
-    ...userEls.map(el => ({ el, role: "user" as const })),
-    ...assistantEls.map(el => ({ el, role: "assistant" as const })),
-  ];
-  tagged.sort((a, b) => {
-    const pos = a.el.compareDocumentPosition(b.el);
-    return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
-  });
+  showToast("Loading full conversation...");
+  const { turns, scrolled, timedOut } = await collectFullTranscript();
+  log.info(`[ArcRift] capture: ${turns.length} turns (scrolled: ${scrolled}, timedOut: ${timedOut})`);
 
+  if (turns.length === 0) {
+    return {
+      success: false, topicsExtracted: 0, triplesExtracted: 0,
+      error: `No messages found on ${platform}. Make sure you're on a chat page with visible messages.`,
+    };
+  }
+
+  // Skip turns already sent from this page — the backend merges the rest into
+  // what it holds, so a partial save extends the stored transcript.
   const lines: string[] = [];
-  for (const { el, role } of tagged) {
-    let text = el.textContent?.trim() || "";
-    if (text.length < 3) continue;
-    // Strip platform-injected prefixes (Gemini wraps messages with "You said" / "Gemini said")
-    text = text
-      .replace(/^You said\s*/i, "")
-      .replace(/^Gemini said\s*/i, "")
-      .replace(/^ChatGPT said\s*/i, "")
-      .replace(/^Claude said\s*/i, "")
-      .replace(/^DeepSeek said\s*/i, "")
-      .trim();
-    if (text.length < 3) continue;
+  for (const { role, text } of turns) {
     const fp = fingerprint(text);
     if (seenMessageFingerprints.has(fp)) continue;
     addFingerprint(fp);
