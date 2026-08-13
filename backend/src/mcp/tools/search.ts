@@ -4,7 +4,7 @@
  * Semantic search across ALL sessions and projects.
  */
 
-import { vectorStore, graphStore } from "../../services/storage";
+import { vectorStore, graphStore, sessionStore } from "../../services/storage";
 import { extractEntitiesFromQuery } from "../../services/extractor";
 import { sanitizeChunks } from "../../middleware/sanitize";
 
@@ -34,18 +34,34 @@ export async function search(
     }
 
     const safe = sanitizeChunks(chunks);
+
+    // Results span every project, so each hit is labelled with the project it
+    // came from. Falls back to the raw id, and to "unknown" when a result
+    // carries no session at all — this used to throw and fail the whole search.
+    let projectNames = new Map<string, string>();
+    try {
+      const sessions = await sessionStore.getSessions();
+      projectNames = new Map(sessions.map(s => [String(s._id), s.projectName]));
+    } catch {
+      // Labels degrade to raw ids; the results themselves are still useful.
+    }
+    const label = (sessionId?: string) =>
+      !sessionId ? "unknown" : projectNames.get(String(sessionId)) || String(sessionId).slice(0, 8);
+
     let response = `Global search results for "${query}":\n\n`;
 
     if (relatedTriples.length > 0) {
       response += `STRUCTURED FACTS (from Knowledge Graph):\n`;
-      response += relatedTriples.map(t => `- [${(t as any).sessionId.slice(0,8)}] ${t.subject} ${t.relation} ${t.object}`).join("\n");
+      response += relatedTriples
+        .map(t => `- [${label(t.sessionId)}] ${t.subject} ${t.relation} ${t.object}`)
+        .join("\n");
       response += `\n\n`;
     }
 
     if (safe.length > 0) {
       response += `RELEVANT CONTEXT CHUNKS:\n`;
-      response += safe.map((c, i) => 
-        `[${i + 1}] session="${(c as any).sessionId.slice(0,8)}" | relevance=${(c.score * 100).toFixed(0)}%\n${c.content}`
+      response += safe.map((c, i) =>
+        `[${i + 1}] project="${label(c.sessionId)}" | relevance=${(c.score * 100).toFixed(0)}%\n${c.content}`
       ).join("\n\n---\n\n");
     }
 

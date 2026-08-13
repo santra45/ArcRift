@@ -16,6 +16,8 @@ export interface Chunk {
   content: string;
   score: number;
   chunkIndex: number;
+  /** Present on global-search results, so a hit can name its project. */
+  sessionId?: string;
   [key: string]: unknown;
 }
 

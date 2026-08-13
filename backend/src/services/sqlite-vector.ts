@@ -246,7 +246,7 @@ export class SqliteVectorStore implements IVectorStore {
   async retrieveGlobalChunks(query: string, topN = 3, keywords: string[] = []): Promise<RetrievedChunk[]> {
     const words = query.trim().split(/\s+/).filter(w => w.length > 0);
     const isSingleWord = words.length <= 1;
-    const candidates = new Map<string, { chunkIndex: number, sentences: Set<string>, maxScore: number }>();
+    const candidates = new Map<string, { chunkIndex: number, sentences: Set<string>, maxScore: number, sessionId: string }>();
 
     try {
       let augmentedQuery = query;
@@ -262,10 +262,13 @@ export class SqliteVectorStore implements IVectorStore {
       const queryEmbedding = await generateEmbedding(augmentedQuery, "query");
       const vector = Buffer.from(new Float32Array(queryEmbedding).buffer);
 
+      // Joined through chunk_metadata so each hit carries the project it came
+      // from — a global search is not useful without that attribution.
       const sentRows = this.db.prepare(`
-        SELECT sm.chunk_id, sm.content, vs.distance
+        SELECT sm.chunk_id, sm.content, vs.distance, m.sessionId
         FROM vec_sentences vs
         JOIN sentence_metadata sm ON vs.sentence_id = sm.sentence_id
+        JOIN chunk_metadata m ON sm.chunk_id = m.chunk_id
         WHERE vs.embedding MATCH ? AND k = 100
       `).all(vector) as any[];
 
@@ -273,7 +276,7 @@ export class SqliteVectorStore implements IVectorStore {
         const score = l2ToScore(r.distance);
         if (score < SENTENCE_THRESHOLD) return;
         if (!candidates.has(r.chunk_id)) {
-          candidates.set(r.chunk_id, { chunkIndex: 0, sentences: new Set(), maxScore: score });
+          candidates.set(r.chunk_id, { chunkIndex: 0, sentences: new Set(), maxScore: score, sessionId: r.sessionId });
         }
         candidates.get(r.chunk_id)!.sentences.add(r.content);
       });
@@ -285,7 +288,7 @@ export class SqliteVectorStore implements IVectorStore {
     if (ftsWords.length > 0) {
       const ftsQuery = ftsWords.map(w => `${w}*`).join(" OR ");
       const ftsRows = this.db.prepare(`
-        SELECT m.chunk_id, m.chunkIndex, m.content
+        SELECT m.chunk_id, m.chunkIndex, m.content, m.sessionId
         FROM fts_chunks f
         JOIN chunk_metadata m ON f.chunk_id = m.chunk_id
         WHERE f.content MATCH ?
@@ -294,7 +297,7 @@ export class SqliteVectorStore implements IVectorStore {
 
       ftsRows.forEach(r => {
         if (!candidates.has(r.chunk_id)) {
-           candidates.set(r.chunk_id, { chunkIndex: r.chunkIndex, sentences: new Set([r.content.substring(0, 300) + "..."]), maxScore: GLOBAL_THRESHOLD });
+           candidates.set(r.chunk_id, { chunkIndex: r.chunkIndex, sentences: new Set([r.content.substring(0, 300) + "..."]), maxScore: GLOBAL_THRESHOLD, sessionId: r.sessionId });
         }
       });
     }
@@ -303,7 +306,8 @@ export class SqliteVectorStore implements IVectorStore {
       .map(c => ({
         content: Array.from(c.sentences).join(" "),
         chunkIndex: c.chunkIndex,
-        score: c.maxScore
+        score: c.maxScore,
+        sessionId: c.sessionId
       }))
       .filter(r => r.content.length > 0)
       .sort((a, b) => b.score - a.score)

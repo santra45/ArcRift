@@ -52,6 +52,8 @@ export interface RetrievedChunk {
   content: string;
   score: number;
   engines?: string[];
+  /** Set by global search so results can say which project they came from. */
+  sessionId?: string;
   [key: string]: any;
 }
 

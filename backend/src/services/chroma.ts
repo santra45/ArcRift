@@ -159,6 +159,8 @@ export async function retrieveGlobalChunks(
     chunkIndex: (metadatas[i]?.chunkIndex as number) ?? i,
     content: doc,
     score: 1 - (distances[i] ?? 1),
+    // Carried through so callers can attribute a hit to its project.
+    sessionId: metadatas[i]?.sessionId as string | undefined,
   }));
 
   // Use a slightly higher threshold for cross-session results to avoid irrelevant drift
