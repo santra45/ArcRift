@@ -3,6 +3,13 @@ import { getSqlite } from "./sqlite";
 import { ISessionStore, Session, FullChat, Job } from "./storage.types";
 import { logger } from "../utils/logger";
 
+/**
+ * How long a job may sit in PROCESSING without being touched before a starting
+ * worker treats it as abandoned. Long enough to clear the slowest real job,
+ * since reclaiming a live one duplicates its work.
+ */
+const STALE_JOB_MS = 10 * 60 * 1000;
+
 export class SqliteSessionStore implements ISessionStore {
   private db = getSqlite();
 
@@ -166,16 +173,41 @@ export class SqliteSessionStore implements ISessionStore {
     return job;
   }
 
+  /**
+   * Claim the next pending job.
+   *
+   * Every MCP client spawns its own server process and every server starts a
+   * worker, so several workers poll this table at once. Selecting without
+   * claiming handed all of them the same job: each ran the same embeddings, and
+   * they queued behind one another at the embedding backend that foreground
+   * recall and search calls also depend on. The claim is a single immediate
+   * transaction so exactly one worker wins.
+   */
   async getNextJob(): Promise<Job | null> {
-    const row = this.db.prepare(`
-      SELECT * FROM jobs 
-      WHERE status = 'PENDING' AND deadLettered = 0 
-      ORDER BY createdAt ASC 
-      LIMIT 1
-    `).get() as any;
-    
-    if (!row) return null;
-    return this.mapRowToJob(row);
+    const claim = this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT * FROM jobs
+        WHERE status = 'PENDING' AND deadLettered = 0
+        ORDER BY createdAt ASC
+        LIMIT 1
+      `).get() as any;
+
+      if (!row) return null;
+
+      const attempts = (Number(row.attempts) || 0) + 1;
+      const res = this.db.prepare(`
+        UPDATE jobs SET status = 'PROCESSING', attempts = ?, updatedAt = ?
+        WHERE id = ? AND status = 'PENDING'
+      `).run(attempts, new Date().toISOString(), row.id);
+
+      // Lost the race — another worker claimed it between the read and write.
+      if (res.changes === 0) return null;
+
+      return { ...row, status: "PROCESSING", attempts };
+    });
+
+    const row = claim.immediate();
+    return row ? this.mapRowToJob(row) : null;
   }
 
   async updateJob(id: string, update: Partial<Job>): Promise<void> {
@@ -226,11 +258,26 @@ export class SqliteSessionStore implements ISessionStore {
     };
   }
 
+  /**
+   * Requeue jobs left PROCESSING by a worker that died.
+   *
+   * Scoped to jobs nothing has touched for a while, because this runs on every
+   * worker startup and workers do not start together: launching a second MCP
+   * client used to snatch back the job the first one was actively running, and
+   * a job already on its second attempt got marked FAILED outright while it was
+   * still making progress.
+   */
   async resetGhostJobs(): Promise<void> {
+    const staleBefore = new Date(Date.now() - STALE_JOB_MS).toISOString();
+
     // Only resume jobs that haven't failed repeatedly
-    this.db.prepare("UPDATE jobs SET status = 'PENDING' WHERE status = 'PROCESSING' AND attempts < 2").run();
+    this.db.prepare(
+      "UPDATE jobs SET status = 'PENDING' WHERE status = 'PROCESSING' AND attempts < 2 AND updatedAt < ?"
+    ).run(staleBefore);
     // Mark heavily failing ghost jobs as FAILED instead of looping forever
-    this.db.prepare("UPDATE jobs SET status = 'FAILED', error = 'Abandoned after multiple crash/resume cycles' WHERE status = 'PROCESSING' AND attempts >= 2").run();
+    this.db.prepare(
+      "UPDATE jobs SET status = 'FAILED', error = 'Abandoned after multiple crash/resume cycles' WHERE status = 'PROCESSING' AND attempts >= 2 AND updatedAt < ?"
+    ).run(staleBefore);
   }
 
   async clearJobs(): Promise<void> {

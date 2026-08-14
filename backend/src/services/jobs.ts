@@ -118,9 +118,10 @@ export async function processNextJob(): Promise<boolean> {
   const job = await sessionStore.getNextJob();
   if (!job) return false;
 
-  const currentAttempts = Number(job.attempts) || 0;
-  logger.info(`[Job Queue] Processing ${job.type} job: ${job._id} (Attempt ${currentAttempts + 1}/5)`);
-  await sessionStore.updateJob(job._id, { status: "PROCESSING", attempts: currentAttempts + 1 });
+  // getNextJob already moved the job to PROCESSING and counted this attempt —
+  // claiming and marking have to be one step or two workers take the same job.
+  const attempt = Number(job.attempts) || 1;
+  logger.info(`[Job Queue] Processing ${job.type} job: ${job._id} (Attempt ${attempt}/5)`);
 
   try {
     if (job.type === "triple_extraction") {
@@ -141,7 +142,7 @@ export async function processNextJob(): Promise<boolean> {
   } catch (err: any) {
     logger.error(`[Job Queue] Failed ${job.type} job: ${job._id} — ${err.message}`);
 
-    if (currentAttempts < 5) {
+    if (attempt < 5) {
       await sessionStore.updateJob(job._id, { status: "PENDING" });
     } else {
       await sessionStore.updateJob(job._id, {
@@ -150,7 +151,7 @@ export async function processNextJob(): Promise<boolean> {
         failedAt: new Date(),
         error: err.message
       });
-      logger.error(`[Job Queue] Job ${job._id} dead-lettered after ${currentAttempts + 1} attempts.`);
+      logger.error(`[Job Queue] Job ${job._id} dead-lettered after ${attempt} attempts.`);
     }
   }
   return true;

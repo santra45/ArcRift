@@ -67,7 +67,11 @@ export async function setActiveSessionId(sessionId: string | null): Promise<void
 
 // ── Job queue schema ──────────────────────────────────────────────
 const jobSchema = new mongoose.Schema({
-  type: { type: String, enum: ["triple_extraction"], required: true },
+  // All three types the queue actually enqueues. The enum listed only the
+  // first, so in Docker mode sentence indexing and chat ingestion were rejected
+  // on save — the rejection surfaced as an unhandled promise rather than an
+  // error anyone saw.
+  type: { type: String, enum: ["triple_extraction", "sentence_indexing", "chat_ingestion"], required: true },
   payload: { type: Object, required: true },
   status: { type: String, enum: ["PENDING", "PROCESSING", "COMPLETED", "FAILED"], default: "PENDING" },
   deadLettered: { type: Boolean, default: false },

@@ -115,8 +115,15 @@ class DockerSessionStore implements ISessionStore {
     await j.save();
     return this.mapMongoJob(j);
   }
+  // Claims the job as it reads it. Several workers poll this queue at once —
+  // one per MCP client plus the backend — and a plain read handed them all the
+  // same job to run in parallel.
   async getNextJob() {
-    const j = await mongoService.Job.findOne({ status: "PENDING", deadLettered: false }).sort({ createdAt: 1 });
+    const j = await mongoService.Job.findOneAndUpdate(
+      { status: "PENDING", deadLettered: false },
+      { $set: { status: "PROCESSING" }, $inc: { attempts: 1 } },
+      { sort: { createdAt: 1 }, new: true }
+    );
     return this.mapMongoJob(j);
   }
   async updateJob(id: string, update: any) {
