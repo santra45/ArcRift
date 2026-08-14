@@ -10,6 +10,13 @@ import { generateHyDEAnswer } from "./hyde";
 // With search_query prefixes, scores move up: distance=8 → 0.67, distance=12 → 0.55
 const l2ToScore = (distance: number) => Math.exp(-distance / 20);
 
+/** Split an ID list so a `WHERE id IN (...)` stays under SQLite's bound-parameter limit. */
+function inBatches<T>(items: T[], size = 400): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 const SESSION_THRESHOLD = 0.30;
 const SENTENCE_THRESHOLD = 0.30; // Lowered to ensure surgical RAG triggers on rephrased queries
 const GLOBAL_THRESHOLD = 0.30;
@@ -66,39 +73,80 @@ export class SqliteVectorStore implements IVectorStore {
 
     const sessionId = chunks[0].sessionId;
 
+    // Chunk IDs are positional and their text is stable under append, so adding
+    // one turn to a long transcript leaves nearly every chunk byte-identical.
+    // Re-embedding the whole session regardless cost ~110s on a 200-chunk
+    // project — past the MCP client's request timeout, so the call was
+    // abandoned as failed even though the write went on to land. Only chunks
+    // whose text actually changed are embedded now.
+    const stored = new Map<string, string>();
+    for (const row of this.db
+      .prepare("SELECT chunk_id, content FROM chunk_metadata WHERE sessionId = ?")
+      .all(sessionId) as { chunk_id: string; content: string }[]) {
+      stored.set(row.chunk_id, row.content);
+    }
+
+    const changed = chunks.filter(c => stored.get(c.id) !== c.content);
+    const incoming = new Set(chunks.map(c => c.id));
+    const removed = [...stored.keys()].filter(id => !incoming.has(id));
+
+    if (changed.length === 0 && removed.length === 0) {
+      logger.info(`Session ${sessionId}: no chunk changed, index left as it is`);
+      return;
+    }
+
     // nomic-embed-text: Use 'document' task for indexing.
-    // Embedded once — this used to run twice over identical input, doubling the
-    // slowest step of every save.
     //
     // Embedding runs before anything is deleted. This call reaches the
     // embedding backend and can fail; deleting first meant a failure here left
     // the session with no chunks at all, silently unsearchable until the next
     // successful save.
-    const chunkEmbeddings = await generateEmbeddings(chunks.map(c => c.content), "document");
+    const chunkEmbeddings = changed.length > 0
+      ? await generateEmbeddings(changed.map(c => c.content), "document")
+      : [];
 
-    await this.deleteChunksBySession(sessionId);
+    this.purgeChunks(removed);
+    // A rewritten chunk can split into fewer sentences than it did before, so
+    // its sentence rows are dropped rather than partly overwritten — otherwise
+    // the leftovers stay searchable under text the chunk no longer contains.
+    this.purgeSentences(changed.map(c => c.id));
 
-    const insertVec = this.db.prepare("INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
+    // vec_chunks is a vec0 virtual table and does not honour REPLACE conflict
+    // resolution, so a rewritten chunk has to have its old vector deleted
+    // first. Nothing noticed while every save wiped the session up front.
+    const deleteVec = this.db.prepare("DELETE FROM vec_chunks WHERE chunk_id = ?");
+    const insertVec = this.db.prepare("INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
     const insertMeta = this.db.prepare("INSERT OR REPLACE INTO chunk_metadata (chunk_id, sessionId, chunkIndex, content, filePath, fileHash) VALUES (?, ?, ?, ?, ?, ?)");
     const insertFts = this.db.prepare("INSERT OR REPLACE INTO fts_chunks (chunk_id, content) VALUES (?, ?)");
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
+    for (let i = 0; i < changed.length; i++) {
+      const chunk = changed[i];
       const embedding = chunkEmbeddings[i];
       const vector = Buffer.from(new Float32Array(embedding).buffer);
 
       this.db.transaction(() => {
+        deleteVec.run(chunk.id);
         insertVec.run(chunk.id, vector);
         insertMeta.run(chunk.id, chunk.sessionId, chunk.chunkIndex, chunk.content, chunk.filePath || null, chunk.fileHash || null);
         insertFts.run(chunk.id, chunk.content);
       })();
     }
 
-    // Offload high-precision sentence indexing to background job
-    // This makes the "Save" instant (only 1-2 embeddings instead of 20)
-    import("./jobs").then(m => m.enqueueJob("sentence_indexing", { chunks }));
+    // Offload high-precision sentence indexing to background job, over the
+    // changed chunks only — the rest keep the sentence rows they already have.
+    //
+    // Deliberately not awaited, but a rejection here used to go unhandled and
+    // take the whole process down with it — in the MCP server that reads to the
+    // client as the connection dropping mid-request.
+    if (changed.length > 0) {
+      import("./jobs")
+        .then(m => m.enqueueJob("sentence_indexing", { chunks: changed }))
+        .catch(err => logger.error(`Failed to queue sentence indexing: ${err?.message ?? err}`));
+    }
 
-    logger.success(`Stored ${chunks.length} chunks (Sentence indexing queued in background)`);
+    logger.success(
+      `Session ${sessionId}: embedded ${changed.length} chunk(s), reused ${chunks.length - changed.length}, removed ${removed.length}`
+    );
   }
 
   async storeFileChunks(chunks: WindowChunk[]): Promise<void> {
@@ -318,6 +366,46 @@ export class SqliteVectorStore implements IVectorStore {
       .filter(r => r.content.length > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, topN);
+  }
+
+  /**
+   * Delete chunks by ID, along with their vectors, keyword rows and sentences.
+   * Used for chunks a re-save dropped, so the rest of the index survives.
+   */
+  private purgeChunks(ids: string[]): void {
+    if (ids.length === 0) return;
+
+    this.purgeSentences(ids);
+    for (const batch of inBatches(ids)) {
+      const ph = batch.map(() => "?").join(",");
+      this.db.transaction(() => {
+        this.db.prepare(`DELETE FROM chunk_metadata WHERE chunk_id IN (${ph})`).run(...batch);
+        this.db.prepare(`DELETE FROM vec_chunks WHERE chunk_id IN (${ph})`).run(...batch);
+        this.db.prepare(`DELETE FROM fts_chunks WHERE chunk_id IN (${ph})`).run(...batch);
+      })();
+    }
+  }
+
+  /** Drop the sentence rows derived from the given chunks. */
+  private purgeSentences(chunkIds: string[]): void {
+    if (chunkIds.length === 0) return;
+
+    const sentenceIds: string[] = [];
+    for (const batch of inBatches(chunkIds)) {
+      const ph = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT sentence_id FROM sentence_metadata WHERE chunk_id IN (${ph})`)
+        .all(...batch) as { sentence_id: string }[];
+      sentenceIds.push(...rows.map(r => r.sentence_id));
+    }
+
+    for (const batch of inBatches(sentenceIds)) {
+      const ph = batch.map(() => "?").join(",");
+      this.db.transaction(() => {
+        this.db.prepare(`DELETE FROM vec_sentences WHERE sentence_id IN (${ph})`).run(...batch);
+        this.db.prepare(`DELETE FROM sentence_metadata WHERE sentence_id IN (${ph})`).run(...batch);
+      })();
+    }
   }
 
   async deleteChunksBySession(sessionId: string): Promise<void> {
