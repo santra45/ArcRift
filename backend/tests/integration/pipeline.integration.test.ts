@@ -12,10 +12,18 @@
  *   - MongoDB running on port 27017
  */
 
+import fs from "fs";
 import path from "path";
 process.env.ARCRIFT_STORAGE_MODE = process.env.ARCRIFT_STORAGE_MODE || "sqlite";
 if (process.env.ARCRIFT_STORAGE_MODE === "sqlite") {
   process.env.SQLITE_DB_PATH = process.env.SQLITE_DB_PATH || path.resolve(__dirname, "../../ArcRift-pipeline-test.db");
+  // Start from an empty database. A leftover file also carries the embedding
+  // fingerprint it was built with, so a run under different settings failed on
+  // a mismatch that had nothing to do with the code under test.
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = `${process.env.SQLITE_DB_PATH}${suffix}`;
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  }
 }
 
 import { initStorage, sessionStore, vectorStore } from "../../src/services/storage";

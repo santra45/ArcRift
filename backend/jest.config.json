@@ -1,9 +1,20 @@
 {
   "testEnvironment": "node",
-  "roots": ["<rootDir>/src", "<rootDir>/tests"],
-  "moduleFileExtensions": ["ts", "js"],
+  "roots": [
+    "<rootDir>/src",
+    "<rootDir>/tests"
+  ],
+  "moduleFileExtensions": [
+    "ts",
+    "js"
+  ],
   "transform": {
-    "^.+\\.(t|j)s$": ["ts-jest", { "tsconfig": "tsconfig.test.json" }]
+    "^.+\\.(t|j)s$": [
+      "ts-jest",
+      {
+        "tsconfig": "tsconfig.test.json"
+      }
+    ]
   },
   "collectCoverageFrom": [
     "src/utils/**/*.ts",
@@ -14,5 +25,8 @@
   ],
   "moduleNameMapper": {
     "^uuid$": "uuid"
-  }
+  },
+  "setupFiles": [
+    "<rootDir>/jest.setup.js"
+  ]
 }

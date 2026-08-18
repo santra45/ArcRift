@@ -12,6 +12,7 @@
  * Runs in SQLite (Zero-Docker) mode for full CI compatibility.
  */
 
+import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
 
@@ -28,6 +29,13 @@ jest.mock("../../src/services/embeddings", () => ({
 // Set storage mode before any service imports
 process.env.ARCRIFT_STORAGE_MODE = "sqlite";
 process.env.SQLITE_DB_PATH = path.resolve(__dirname, "../../ArcRift-isolation-test.db");
+// Start from an empty database. A leftover file also carries the embedding
+// fingerprint it was built with, so a run under different settings failed on a
+// mismatch that had nothing to do with the code under test.
+for (const suffix of ["", "-wal", "-shm"]) {
+  const file = `${process.env.SQLITE_DB_PATH}${suffix}`;
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}
 dotenv.config();
 
 import { initStorage, sessionStore, vectorStore } from "../../src/services/storage";
