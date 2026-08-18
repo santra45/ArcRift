@@ -37,7 +37,27 @@ const PROVIDER_DEFAULTS: Record<EmbeddingProvider, { baseUrl: string; model: str
   "gemini": { baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "text-embedding-004" },
 };
 
-const SETTINGS_PATH = path.join(process.cwd(), "ArcRift-settings.json");
+/**
+ * A base URL only means anything next to the provider it was saved for. Left
+ * unchecked, switching provider kept the previous endpoint — Gemini requests
+ * went to the local Ollama port and came back as a bare 404.
+ */
+export function baseUrlSuitsProvider(provider: EmbeddingProvider, baseUrl: string): boolean {
+  if (!baseUrl) return false;
+  return !Object.entries(PROVIDER_DEFAULTS).some(
+    ([other, defaults]) => other !== provider && defaults.baseUrl === baseUrl
+  );
+}
+
+export function defaultsForProvider(provider: EmbeddingProvider) {
+  return PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.ollama;
+}
+
+// Overridable so a test run cannot pick up whatever provider the developer
+// happens to have configured — the integration suite embedded through a real
+// cloud provider once this file gained an API key.
+const SETTINGS_PATH =
+  process.env.ARCRIFT_SETTINGS_PATH || path.join(process.cwd(), "ArcRift-settings.json");
 
 let cachedSettings: Settings | null = null;
 
@@ -84,9 +104,15 @@ export function getEmbeddingConfig(): EmbeddingConfig {
   const defaults = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.ollama;
   const isOllama = provider === "ollama";
 
+  // Ignore an endpoint that plainly belongs to a different provider rather than
+  // sending this one's requests to it.
+  const savedBaseUrl = baseUrlSuitsProvider(provider, settings.embeddingBaseUrl || "")
+    ? settings.embeddingBaseUrl
+    : "";
+
   return {
     provider,
-    baseUrl: settings.embeddingBaseUrl || (isOllama ? process.env.OLLAMA_URL : "") || defaults.baseUrl,
+    baseUrl: savedBaseUrl || (isOllama ? process.env.OLLAMA_URL : "") || defaults.baseUrl,
     apiKey: settings.embeddingApiKey || process.env.EMBEDDING_API_KEY || "",
     model:
       settings.embeddingModel ||
