@@ -3,6 +3,7 @@ import { getSqlite } from "./sqlite";
 import {
   IMemoryStore, Memory, MemoryCategory, MemoryRelation, MemoryRevision, WorkingMemory
 } from "./storage.types";
+import { levelScore } from "../utils/importance";
 
 /**
  * Importance is a REAL column, but callers still hand us the old level names
@@ -13,12 +14,13 @@ function normalizeImportance(value: unknown): number {
   if (typeof value === "number") return clampImportance(value);
 
   if (typeof value === "string") {
-    switch (value.toLowerCase()) {
-      case "critical": return 1.0;
-      case "high": return 0.8;
-      case "medium": return 0.5;
-      case "low": return 0.2;
-    }
+    // Deliberately the same scale the MCP boundary writes with. Two mappings
+    // meant a memory saved as "high" (0.75) missed an `importance >= high`
+    // filter that resolved "high" to 0.8, and nothing saved as "critical"
+    // (0.95) ever cleared a "critical" filter at 1.0.
+    const level = levelScore(value);
+    if (level !== null) return clampImportance(level);
+
     const parsed = parseFloat(value);
     return isNaN(parsed) ? 0.5 : clampImportance(parsed);
   }

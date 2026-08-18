@@ -10,7 +10,7 @@ import { enqueueJob } from "../../services/jobs";
 import { slidingWindowChunks } from "../../services/chunker";
 import { logger } from "../../utils/logger";
 import { mergeChatText, splitTurns } from "../../utils/chat-merge";
-import { DEFAULT_IMPORTANCE, ImportanceLevel, importanceLabel, importanceToScore } from "./importance";
+import { DEFAULT_IMPORTANCE, ImportanceLevel, importanceLabel, importanceToScore } from "../../utils/importance";
 
 /** Long enough to tell two cards apart in a list, short enough to be a title. */
 const TITLE_MAX_LENGTH = 60;

@@ -3,6 +3,7 @@ import fs from "fs";
 import { SqliteMemoryStore } from "../sqlite-memory";
 import { SqliteSessionStore } from "../sqlite-session";
 import { initSqlite, getSqlite } from "../sqlite";
+import { IMPORTANCE_LEVELS, importanceToScore } from "../../utils/importance";
 
 // Deliberately not the filename the storage suite uses — the two run in
 // separate workers and would otherwise fight over the same database.
@@ -83,7 +84,7 @@ describe("SqliteMemoryStore", () => {
         content: "Imported from an older export.",
         importance: "critical" as any
       });
-      expect(created.importance).toBe(1);
+      expect(created.importance).toBe(importanceToScore("critical"));
     });
 
     it("updates only the fields it is given", async () => {
@@ -109,7 +110,7 @@ describe("SqliteMemoryStore", () => {
       const ordered = await memoryStore.getMemories(sessionId);
       const importances = ordered.map(m => m.importance);
       expect(importances).toEqual([...importances].sort((a, b) => b - a));
-      expect(importances[0]).toBe(1);
+      expect(importances[0]).toBe(importanceToScore("critical"));
     });
 
     it("filters by a minimum importance", async () => {
@@ -175,6 +176,37 @@ describe("SqliteMemoryStore", () => {
     it("still matches an ordinary substring", async () => {
       const results = await memoryStore.getMemories(escapeSessionId, { query: "Reads the" });
       expect(results).toHaveLength(2);
+    });
+  });
+
+  describe("importance filter", () => {
+    let importanceSessionId: string;
+
+    beforeAll(async () => {
+      const session = await sessionStore.createSession("Importance Project", "chrome");
+      importanceSessionId = session._id;
+
+      // Written the way store_memory writes them, so the filter is exercised
+      // against real stored scores rather than hand-picked numbers.
+      for (const level of IMPORTANCE_LEVELS) {
+        await memoryStore.createMemory({
+          sessionId: importanceSessionId,
+          content: `A ${level} memory.`,
+          importance: importanceToScore(level)
+        });
+      }
+    });
+
+    it.each(IMPORTANCE_LEVELS)("returns a memory saved as %s when filtering for it", async level => {
+      const results = await memoryStore.getMemories(importanceSessionId, { importance: level });
+      expect(results.map(m => m.content)).toContain(`A ${level} memory.`);
+    });
+
+    it("filters as a threshold, not an exact match", async () => {
+      const results = await memoryStore.getMemories(importanceSessionId, { importance: "high" });
+      const contents = results.map(m => m.content);
+      expect(contents).toContain("A critical memory.");
+      expect(contents).not.toContain("A medium memory.");
     });
   });
 

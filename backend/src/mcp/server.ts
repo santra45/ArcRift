@@ -44,7 +44,7 @@ import { memoryEvolvesChain } from "./tools/memory_evolves_chain";
 import { memoryRelationAdd } from "./tools/memory_relation_add";
 import { memoryRelationList } from "./tools/memory_relation_list";
 import { memoryRelationDelete } from "./tools/memory_relation_delete";
-import { DEFAULT_IMPORTANCE, IMPORTANCE_LEVELS, ImportanceLevel } from "./tools/importance";
+import { DEFAULT_IMPORTANCE, IMPORTANCE_LEVELS, ImportanceLevel } from "../utils/importance";
 import { initStorage, sessionStore } from "../services/storage";
 import { MemoryCategory } from "../services/storage.types";
 import { logger } from "../utils/logger";

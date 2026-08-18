@@ -1,10 +1,14 @@
 /**
- * mcp/tools/importance.ts — importance at the MCP boundary.
+ * utils/importance.ts — the one place a memory importance level becomes a number.
  *
  * Memories store importance as a number so they can be ordered and
  * thresholded, but picking 0.75 out of the air is an awkward thing to ask of
  * an assistant. Tools take the level names and convert here. A caller that
  * already has a score can pass the number straight through.
+ *
+ * This lives in utils rather than beside the MCP tools because the store reads
+ * the same scale when filtering: two mappings would mean a memory saved as
+ * "high" did not come back from a search for "high".
  */
 
 export type ImportanceLevel = "critical" | "high" | "medium" | "low";
@@ -22,6 +26,12 @@ export const DEFAULT_IMPORTANCE: ImportanceLevel = "high";
 
 const isLevel = (value: string): value is ImportanceLevel => value in LEVEL_SCORES;
 
+/** Score for a level name, or null when the string is not a level. */
+export function levelScore(value: string): number | null {
+  const level = value.toLowerCase();
+  return isLevel(level) ? LEVEL_SCORES[level] : null;
+}
+
 /** Score for a level name or a raw number, clamped to the 0–1 the column holds. */
 export function importanceToScore(value: ImportanceLevel | number = DEFAULT_IMPORTANCE): number {
   if (typeof value === "number") {
@@ -30,8 +40,7 @@ export function importanceToScore(value: ImportanceLevel | number = DEFAULT_IMPO
     return Math.max(0, Math.min(1, value));
   }
 
-  const level = String(value).toLowerCase();
-  return isLevel(level) ? LEVEL_SCORES[level] : LEVEL_SCORES[DEFAULT_IMPORTANCE];
+  return levelScore(String(value)) ?? LEVEL_SCORES[DEFAULT_IMPORTANCE];
 }
 
 /** How the importance reads back in a tool response: "HIGH", or the score. */

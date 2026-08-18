@@ -18,7 +18,7 @@ for (const f of [TEST_DB, `${TEST_DB}-wal`, `${TEST_DB}-shm`]) {
 }
 
 import { memoryStore, sessionStore } from "../../../services/storage";
-import { ImportanceLevel } from "../importance";
+import { ImportanceLevel } from "../../../utils/importance";
 import { store } from "../store";
 
 // Indexing the transcript would otherwise call the embedding backend.
