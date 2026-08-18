@@ -2,13 +2,18 @@ import { Router, Request, Response } from "express";
 import axios from "axios";
 import {
   EmbeddingProvider,
+  ExtractionProvider,
   baseUrlSuitsProvider,
   defaultsForProvider,
+  extractionBaseUrlSuits,
+  extractionDefaultsFor,
   getEmbeddingConfig,
+  getExtractionConfig,
   getSettings,
   updateSettings
 } from "../utils/settings";
 import { generateEmbedding, listProviderModels } from "../services/embeddings";
+import { extractTriplesFromText, listExtractionModels } from "../services/extractor";
 import { readIndexFingerprint } from "../services/index-fingerprint";
 import { logger } from "../utils/logger";
 
@@ -16,9 +21,13 @@ const router = Router();
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 
 const EMBEDDING_PROVIDERS: EmbeddingProvider[] = ["ollama", "openai-compatible", "gemini"];
+const EXTRACTION_PROVIDERS: ExtractionProvider[] = ["ollama", "groq", "local-openai"];
 
 const isProvider = (value: unknown): value is EmbeddingProvider =>
   typeof value === "string" && EMBEDDING_PROVIDERS.includes(value as EmbeddingProvider);
+
+const isExtractionProvider = (value: unknown): value is ExtractionProvider =>
+  typeof value === "string" && EXTRACTION_PROVIDERS.includes(value as ExtractionProvider);
 
 /** Never send a stored key back to the browser — only whether one is set. */
 function redactKey(apiKey: string): string {
@@ -47,6 +56,7 @@ router.get("/", async (_req: Request, res: Response) => {
     const activeExtractionModel = settings.ollamaExtractionModel || process.env.OLLAMA_MODEL || "llama3.1:8b";
 
     const embedding = getEmbeddingConfig();
+    const extraction = getExtractionConfig();
     const fingerprint = readIndexFingerprint();
 
     res.json({
@@ -65,6 +75,16 @@ router.get("/", async (_req: Request, res: Response) => {
         dimension: embedding.dimension,
         apiKeySet: Boolean(embedding.apiKey),
         apiKeyHint: redactKey(embedding.apiKey)
+      },
+      extraction: {
+        providers: EXTRACTION_PROVIDERS,
+        // Null means nothing was chosen and the backend still probes for one.
+        provider: extraction.provider,
+        resolvedProvider: extraction.provider || "auto",
+        baseUrl: extraction.baseUrl,
+        model: extraction.model,
+        apiKeySet: Boolean(extraction.apiKey),
+        apiKeyHint: redactKey(extraction.apiKey)
       },
       // The index is only searchable while it agrees with these settings, so
       // the UI needs to know when a change has left a rebuild outstanding.
@@ -97,11 +117,20 @@ router.post("/", async (req: Request, res: Response) => {
       embeddingBaseUrl,
       embeddingApiKey,
       embeddingModel,
-      embeddingDimension
+      embeddingDimension,
+      extractionProvider,
+      extractionBaseUrl,
+      extractionApiKey,
+      extractionModel
     } = req.body;
 
     if (embeddingProvider !== undefined && !isProvider(embeddingProvider)) {
       res.status(400).json({ error: `embeddingProvider must be one of: ${EMBEDDING_PROVIDERS.join(", ")}` });
+      return;
+    }
+
+    if (extractionProvider !== undefined && extractionProvider !== null && !isExtractionProvider(extractionProvider)) {
+      res.status(400).json({ error: `extractionProvider must be one of: ${EXTRACTION_PROVIDERS.join(", ")}` });
       return;
     }
 
@@ -129,13 +158,36 @@ router.post("/", async (req: Request, res: Response) => {
     // the UI can save without ever round-tripping the secret it never received.
     if (typeof embeddingApiKey === "string") patch.embeddingApiKey = embeddingApiKey;
 
+    // Null clears the choice and hands the decision back to the probe.
+    if (extractionProvider !== undefined) {
+      patch.extractionProvider = extractionProvider === null ? undefined : extractionProvider;
+    }
+    if (typeof extractionModel === "string") patch.extractionModel = extractionModel;
+    if (typeof extractionApiKey === "string") patch.extractionApiKey = extractionApiKey;
+
+    if (typeof extractionBaseUrl === "string") {
+      const target = extractionProvider || getSettings().extractionProvider || "ollama";
+      patch.extractionBaseUrl = extractionBaseUrlSuits(target, extractionBaseUrl)
+        ? extractionBaseUrl
+        : extractionDefaultsFor(target).baseUrl;
+    }
+
     updateSettings(patch);
 
     const embedding = getEmbeddingConfig();
+    const extraction = getExtractionConfig();
     const fingerprint = readIndexFingerprint();
 
     res.json({
       success: true,
+      extraction: {
+        provider: extraction.provider,
+        resolvedProvider: extraction.provider || "auto",
+        baseUrl: extraction.baseUrl,
+        model: extraction.model,
+        apiKeySet: Boolean(extraction.apiKey),
+        apiKeyHint: redactKey(extraction.apiKey)
+      },
       embedding: {
         provider: embedding.provider,
         baseUrl: embedding.baseUrl,
@@ -211,6 +263,64 @@ router.post("/embedding/test", async (_req: Request, res: Response) => {
     res.status(502).json({
       success: false,
       provider: config.provider,
+      model: config.model,
+      error: err?.message || String(err)
+    });
+  }
+});
+
+// POST /api/settings/extraction/models — what the extraction backend can run.
+router.post("/extraction/models", async (req: Request, res: Response) => {
+  const { provider, baseUrl, apiKey } = req.body || {};
+
+  if (provider !== undefined && !isExtractionProvider(provider)) {
+    res.status(400).json({ error: `provider must be one of: ${EXTRACTION_PROVIDERS.join(", ")}` });
+    return;
+  }
+
+  try {
+    const models = await listExtractionModels({
+      provider,
+      baseUrl: typeof baseUrl === "string" ? baseUrl : undefined,
+      apiKey: typeof apiKey === "string" ? apiKey : undefined
+    });
+
+    res.json({ success: true, provider: provider || getExtractionConfig().provider || "ollama", models });
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const detail =
+      status === 400 || status === 401 || status === 403
+        ? "The provider rejected these credentials."
+        : err?.message || String(err);
+    logger.warn(`Listing extraction models failed for ${provider || "saved provider"}: ${err?.message}`);
+    res.status(502).json({ success: false, error: detail });
+  }
+});
+
+// POST /api/settings/extraction/test — run a real extraction against the saved
+// config. A prompt that yields a known triple proves the whole path, not just
+// that the endpoint answers.
+router.post("/extraction/test", async (_req: Request, res: Response) => {
+  const config = getExtractionConfig();
+  const startedAt = Date.now();
+
+  try {
+    // Deliberately not extractTriples: that catches per-chunk failures and
+    // carries on, so a broken backend would come back as a cheerful zero.
+    const triples = await extractTriplesFromText("ArcRift uses SQLite for local storage.");
+
+    res.json({
+      success: true,
+      provider: config.provider || "auto",
+      model: config.model,
+      tripleCount: triples.length,
+      latencyMs: Date.now() - startedAt
+    });
+  } catch (err: any) {
+    logger.warn(`Extraction provider test failed (${config.provider || "auto"}): ${err?.message}`);
+    res.status(502).json({
+      success: false,
+      provider: config.provider || "auto",
       model: config.model,
       error: err?.message || String(err)
     });

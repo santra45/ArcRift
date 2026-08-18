@@ -1,6 +1,6 @@
 import axios from "axios";
 import { logger } from "../utils/logger";
-import { getSettings } from "../utils/settings";
+import { ExtractionProvider, extractionDefaultsFor, getExtractionConfig, getSettings } from "../utils/settings";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export interface Triple {
@@ -38,6 +38,67 @@ export function chunkText(text: string): string[] {
   return chunks;
 }
 
+export interface ExtractionModel {
+  id: string;
+  label: string;
+  description?: string;
+  /** False for models that exist but cannot do chat completion. */
+  suitable: boolean;
+}
+
+/**
+ * Ask an extraction backend what it can run. Credentials come from the
+ * argument so a key can be checked before it is committed to settings.
+ */
+export async function listExtractionModels(override?: {
+  provider?: ExtractionProvider;
+  baseUrl?: string;
+  apiKey?: string;
+}): Promise<ExtractionModel[]> {
+  const saved = getExtractionConfig();
+  const provider = override?.provider || saved.provider || "ollama";
+  const switching = Boolean(override?.provider && override.provider !== saved.provider);
+  const apiKey = override?.apiKey || (switching ? "" : saved.apiKey);
+  const baseUrl = (override?.baseUrl || (switching ? "" : saved.baseUrl) || extractionDefaultsFor(provider).baseUrl).replace(/\/+$/, "");
+
+  if (provider === "ollama") {
+    const response = await axios.get(`${baseUrl}/api/tags`, { timeout: 5000 });
+    const models = Array.isArray(response.data?.models) ? response.data.models : [];
+    return models.map((m: any) => {
+      const id = String(m.name || "");
+      return {
+        id,
+        label: id,
+        // Embedding models are listed alongside chat ones and cannot generate.
+        suitable: !/embed/i.test(id)
+      };
+    });
+  }
+
+  if (provider === "groq" && !apiKey) {
+    throw new Error("A Groq API key is required to list models.");
+  }
+
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const response = await axios.get(`${baseUrl}/models`, { headers, timeout: 10000 });
+  const models = Array.isArray(response.data?.data) ? response.data.data : [];
+
+  return models.map((m: any) => {
+    const id = String(m.id || "");
+    return {
+      id,
+      label: id,
+      description: m.owned_by ? `by ${m.owned_by}` : undefined,
+      // Groq serves speech and moderation models from the same list; neither
+      // can answer an extraction prompt. There is no capability field to go on,
+      // so this is a name heuristic — the picker can still show everything.
+      suitable: !/whisper|tts|orpheus|playai|guard|embed/i.test(id)
+    };
+  });
+}
+
 // ── v1.4.7: Smart Backend Selection ───────────────────────────────
 //
 // Priority:
@@ -55,12 +116,6 @@ export function chunkText(text: string): string[] {
 let resolvedBackend: "ollama" | "groq" | "local-openai" | null = null;
 
 async function detectBackend(): Promise<"ollama" | "groq" | "local-openai"> {
-  // Explicit override takes highest priority
-  const envBackend = process.env.GRAPH_BACKEND?.toLowerCase();
-  if (envBackend === "groq") return "groq";
-  if (envBackend === "ollama") return "ollama";
-  if (envBackend === "local-openai") return "local-openai";
-
   // Auto-detect: try to reach Ollama
   try {
     const ollamaUrl = process.env.OLLAMA_URL ?? "http://localhost:11434";
@@ -93,6 +148,12 @@ async function detectBackend(): Promise<"ollama" | "groq" | "local-openai"> {
 }
 
 async function getBackend(): Promise<"ollama" | "groq" | "local-openai"> {
+  // Read on every call rather than cached: a provider picked in the dashboard
+  // has to take effect without restarting the server. Only the probe result is
+  // worth caching, since that one costs a network round trip.
+  const configured = getExtractionConfig().provider;
+  if (configured) return configured;
+
   if (!resolvedBackend) {
     resolvedBackend = await detectBackend();
   }
@@ -106,31 +167,54 @@ export function _resetBackendForTest() {
 
 // ── Groq LLM call ─────────────────────────────────────────────────
 async function callGroq(prompt: string, maxTokens = 1000): Promise<string> {
-  const model = process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile";
-  const response = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: maxTokens,
-      temperature: 0.1,
-    },
-    {
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+  const config = getExtractionConfig();
+  const model = config.provider === "groq" ? config.model : process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
+  const baseUrl = (config.provider === "groq" ? config.baseUrl : "https://api.groq.com/openai/v1").replace(/\/+$/, "");
+
+  if (!config.apiKey) {
+    throw new Error("Groq extraction needs an API key — set one in Settings or GROQ_API_KEY.");
+  }
+
+  try {
+    const response = await axios.post(
+      `${baseUrl}/chat/completions`,
+      {
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: maxTokens,
+        temperature: 0.1,
       },
-      timeout: 20000,
+      {
+        headers: {
+          "Authorization": `Bearer ${config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 20000,
+      }
+    );
+    return response.data.choices[0].message.content;
+  } catch (err: any) {
+    // Hosted catalogues retire models, and the bare 404 that follows reads as
+    // the whole API being down rather than one name having gone away.
+    if (err?.response?.status === 404) {
+      throw new Error(
+        `Groq has no model "${model}" — it may have been retired. Pick a current one in Settings › Providers.`
+      );
     }
-  );
-  return response.data.choices[0].message.content;
+    throw err;
+  }
 }
 
 // ── Ollama LLM call ───────────────────────────────────────────────
 async function callOllama(prompt: string, maxTokens = 1000): Promise<string> {
-  const ollamaUrl = process.env.OLLAMA_URL ?? "http://localhost:11434";
+  const config = getExtractionConfig();
+  const ollamaUrl = (config.provider === "ollama" ? config.baseUrl : process.env.OLLAMA_URL ?? "http://localhost:11434").replace(/\/+$/, "");
   const settings = getSettings();
-  const model = settings.ollamaExtractionModel || process.env.OLLAMA_MODEL || "llama3.1:8b";
+  const model =
+    (config.provider === "ollama" ? config.model : "") ||
+    settings.ollamaExtractionModel ||
+    process.env.OLLAMA_MODEL ||
+    "llama3.1:8b";
 
   const response = await axios.post(
     `${ollamaUrl}/api/generate`,

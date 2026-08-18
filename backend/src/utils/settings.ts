@@ -3,6 +3,7 @@ import fs from "fs";
 import { logger } from "./logger";
 
 export type EmbeddingProvider = "ollama" | "openai-compatible" | "gemini";
+export type ExtractionProvider = "ollama" | "groq" | "local-openai";
 
 export interface Settings {
   ollamaEmbeddingModel?: string;
@@ -16,6 +17,13 @@ export interface Settings {
   embeddingApiKey?: string;
   embeddingModel?: string;
   embeddingDimension?: number;
+
+  // Extraction backend. Absent means the probe order in extractor.ts decides,
+  // which is what installs relied on before this was configurable.
+  extractionProvider?: ExtractionProvider;
+  extractionBaseUrl?: string;
+  extractionApiKey?: string;
+  extractionModel?: string;
 }
 
 /** The embedding backend a call should use, with every fallback already applied. */
@@ -27,6 +35,14 @@ export interface EmbeddingConfig {
   dimension: number;
 }
 
+/** The extraction backend, or provider `null` to leave the choice to probing. */
+export interface ExtractionConfig {
+  provider: ExtractionProvider | null;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
 // vec_chunks and vec_sentences are declared float[768] and a vec0 table's
 // dimension is fixed at creation, so this is the only width the index holds.
 export const DEFAULT_EMBEDDING_DIMENSION = 768;
@@ -35,6 +51,12 @@ const PROVIDER_DEFAULTS: Record<EmbeddingProvider, { baseUrl: string; model: str
   "ollama": { baseUrl: "http://localhost:11434", model: "nomic-embed-text" },
   "openai-compatible": { baseUrl: "https://api.openai.com/v1", model: "text-embedding-3-small" },
   "gemini": { baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "text-embedding-004" },
+};
+
+export const EXTRACTION_DEFAULTS: Record<ExtractionProvider, { baseUrl: string; model: string }> = {
+  "ollama": { baseUrl: "http://localhost:11434", model: "llama3.1:8b" },
+  "groq": { baseUrl: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b" },
+  "local-openai": { baseUrl: "http://localhost:1234/v1", model: "local-model" },
 };
 
 /**
@@ -51,6 +73,17 @@ export function baseUrlSuitsProvider(provider: EmbeddingProvider, baseUrl: strin
 
 export function defaultsForProvider(provider: EmbeddingProvider) {
   return PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.ollama;
+}
+
+export function extractionBaseUrlSuits(provider: ExtractionProvider, baseUrl: string): boolean {
+  if (!baseUrl) return false;
+  return !Object.entries(EXTRACTION_DEFAULTS).some(
+    ([other, defaults]) => other !== provider && defaults.baseUrl === baseUrl
+  );
+}
+
+export function extractionDefaultsFor(provider: ExtractionProvider) {
+  return EXTRACTION_DEFAULTS[provider] || EXTRACTION_DEFAULTS.ollama;
 }
 
 // Overridable so a test run cannot pick up whatever provider the developer
@@ -98,6 +131,47 @@ export function updateSettings(settings: Partial<Settings>): Settings {
  * OLLAMA_EMBED_MODEL are still honoured for the Ollama provider so installs
  * that only ever set those keep the model their index was built with.
  */
+/**
+ * Extraction backend. A saved provider wins over GRAPH_BACKEND: it is what the
+ * dashboard shows, and silently overriding it from the environment makes the
+ * screen lie about which model is running.
+ *
+ * `provider: null` means nothing was chosen and extractor.ts should probe, the
+ * behaviour every install had before this became configurable.
+ */
+export function getExtractionConfig(): ExtractionConfig {
+  const settings = getSettings();
+  const envBackend = process.env.GRAPH_BACKEND?.toLowerCase();
+  const provider: ExtractionProvider | null =
+    settings.extractionProvider ||
+    (envBackend === "groq" || envBackend === "ollama" || envBackend === "local-openai" ? envBackend : null);
+
+  const defaults = provider ? EXTRACTION_DEFAULTS[provider] : EXTRACTION_DEFAULTS.ollama;
+  const savedBaseUrl =
+    provider && extractionBaseUrlSuits(provider, settings.extractionBaseUrl || "")
+      ? settings.extractionBaseUrl
+      : "";
+
+  const envBaseUrl =
+    provider === "ollama" ? process.env.OLLAMA_URL
+      : provider === "local-openai" ? process.env.LOCAL_OPENAI_URL
+      : "";
+
+  return {
+    provider,
+    baseUrl: savedBaseUrl || envBaseUrl || defaults.baseUrl,
+    apiKey: settings.extractionApiKey || process.env.GROQ_API_KEY || "",
+    model:
+      settings.extractionModel ||
+      (provider === "ollama"
+        ? settings.ollamaExtractionModel || process.env.OLLAMA_MODEL
+        : provider === "groq"
+          ? process.env.GROQ_MODEL
+          : "") ||
+      defaults.model,
+  };
+}
+
 export function getEmbeddingConfig(): EmbeddingConfig {
   const settings = getSettings();
   const provider = settings.embeddingProvider || "ollama";
