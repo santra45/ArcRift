@@ -25,3 +25,6 @@ npm-debug.log*
 
 # CI artifacts (generated at runtime, never committed)
 selector-failures.json
+# Local runtime settings — holds API keys, must never be committed
+backend/ArcRift-settings.json
+ArcRift-settings.json

@@ -1,0 +1,11 @@
+{
+  "ollamaEmbeddingModel": "nomic-embed-text",
+  "ollamaExtractionModel": "llama3.1:8b",
+  "contextMode": "raw",
+
+  "embeddingProvider": "ollama",
+  "embeddingBaseUrl": "http://localhost:11434",
+  "embeddingModel": "nomic-embed-text",
+  "embeddingDimension": 768,
+  "embeddingApiKey": ""
+}
