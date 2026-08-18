@@ -165,6 +165,21 @@ export function _resetBackendForTest() {
   resolvedBackend = null;
 }
 
+/**
+ * Reasoning models spend the token budget thinking before they write anything,
+ * so a short request comes back with an empty `content` and finish_reason
+ * "length". Turning reasoning down leaves room for an actual answer.
+ *
+ * The parameter is per-model and most models reject it outright, and the ones
+ * that take it do not agree on the vocabulary, so it is only sent where it is
+ * known to work.
+ */
+function reasoningParams(model: string): Record<string, string> {
+  if (/gpt-oss/i.test(model)) return { reasoning_effort: "low" };
+  if (/qwen3/i.test(model)) return { reasoning_effort: "none" };
+  return {};
+}
+
 // ── Groq LLM call ─────────────────────────────────────────────────
 async function callGroq(prompt: string, maxTokens = 1000): Promise<string> {
   const config = getExtractionConfig();
@@ -175,14 +190,15 @@ async function callGroq(prompt: string, maxTokens = 1000): Promise<string> {
     throw new Error("Groq extraction needs an API key — set one in Settings or GROQ_API_KEY.");
   }
 
-  try {
+  const send = async (tokens: number) => {
     const response = await axios.post(
       `${baseUrl}/chat/completions`,
       {
         model,
         messages: [{ role: "user", content: prompt }],
-        max_tokens: maxTokens,
+        max_tokens: tokens,
         temperature: 0.1,
+        ...reasoningParams(model),
       },
       {
         headers: {
@@ -192,7 +208,24 @@ async function callGroq(prompt: string, maxTokens = 1000): Promise<string> {
         timeout: 20000,
       }
     );
-    return response.data.choices[0].message.content;
+    const choice = response.data?.choices?.[0];
+    return { content: choice?.message?.content ?? "", finishReason: choice?.finish_reason };
+  };
+
+  try {
+    const first = await send(maxTokens);
+    if (first.content.trim()) return first.content;
+
+    // Empty content after hitting the cap means the whole budget went on
+    // reasoning. reasoningParams only covers models known to accept the hint,
+    // so retry wider for anything it does not recognise.
+    if (first.finishReason === "length") {
+      logger.warn(`[ArcRift] ${model} returned only reasoning at ${maxTokens} tokens — retrying with more room.`);
+      const retry = await send(Math.min(maxTokens * 8, 4000));
+      if (retry.content.trim()) return retry.content;
+    }
+
+    return first.content;
   } catch (err: any) {
     // Hosted catalogues retire models, and the bare 404 that follows reads as
     // the whole API being down rather than one name having gone away.
