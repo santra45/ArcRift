@@ -33,9 +33,14 @@ export const INPUT_SELECTOR_STRATEGIES: Record<Platform, string[]> = {
     'div[contenteditable="true"]',                            // generic fallback
   ],
   gemini: [
-    '.ql-editor',                                             // Quill editor — confirmed
-    'rich-textarea [contenteditable="true"]',                 // inner editable
-    '[aria-label*="message"]',                                // aria fallback
+    'rich-textarea [contenteditable="true"]',                 // inner editable (primary)
+    'rich-textarea div[contenteditable="true"]',              // rich-textarea div variant
+    'div.ql-editor[contenteditable="true"]',                  // Quill editor
+    '.ql-editor',                                             // Quill editor class — confirmed
+    'div[contenteditable="true"][aria-label*="prompt" i]',    // aria prompt fallback
+    'div[contenteditable="true"][aria-label*="message" i]',   // aria message fallback
+    'div[contenteditable="true"][aria-label*="输入" i]',        // zh-CN localized aria
+    'div[contenteditable="true"][aria-label*="Ask" i]',       // aria Ask fallback
     'div[contenteditable][role="textbox"]',                   // role fallback
     'div[contenteditable="true"]',                            // generic fallback
   ],
