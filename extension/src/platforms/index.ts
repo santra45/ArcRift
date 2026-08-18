@@ -80,7 +80,8 @@ export function queryOne(selectors: string[]): Element | null {
 // list. Unguarded, one selector a browser cannot parse throws out of whichever
 // event handler called it — and the send-button handler is shared by every
 // platform, so a Gemini-only selector would break send detection everywhere.
-export function matchesAny(el: Element, selectors: string[]): boolean {
+export function matchesAny(el: Element | null | undefined, selectors: string[]): boolean {
+  if (!el) return false;
   for (const sel of selectors) {
     try {
       if (el.closest(sel)) return true;

@@ -494,7 +494,10 @@ async function handlePromptKeydown(e: KeyboardEvent) {
     reportSelectorFailure();
     return;
   }
-  if (!document.activeElement?.closest(config.inputSelectors.join(","))) return;
+  // Tested one selector at a time rather than as a joined list: a single entry
+  // the browser cannot parse invalidates a whole comma-joined selector, so one
+  // unsupported strategy would stop every other one from matching.
+  if (!matchesAny(document.activeElement, config.inputSelectors)) return;
   const promptText = input.textContent?.trim() || (input as HTMLTextAreaElement).value?.trim() || "";
   if (!promptText || promptText.length < 5) return;
   lastSendTimestamp = now;

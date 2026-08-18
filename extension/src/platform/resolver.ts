@@ -81,8 +81,10 @@ export const INPUT_SELECTOR_STRATEGIES: Record<Platform, string[]> = {
 export function resolveInputSelector(platform: Platform): Element | null {
   const strategies = INPUT_SELECTOR_STRATEGIES[platform];
   for (const selector of strategies) {
-    const el = document.querySelector(selector);
-    if (el) return el;
+    try {
+      const el = document.querySelector(selector);
+      if (el) return el;
+    } catch { /* invalid selector */ }
   }
   console.warn(
     `[ArcRift resolver] No input selector resolved for "${platform}". ` +
