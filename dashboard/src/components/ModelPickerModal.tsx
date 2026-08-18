@@ -1,8 +1,24 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { extractErrorMessage, listProviderModels, type EmbeddingProvider, type ProviderModel } from "../api/ArcRift";
+import {
+  extractErrorMessage,
+  listExtractionModels,
+  listProviderModels,
+  type EmbeddingProvider,
+  type ExtractionProvider,
+  type ProviderModel
+} from "../api/ArcRift";
+
+/** Which job the picked model has to do — decides who gets asked and what "suitable" means. */
+export type ModelKind = "embedding" | "extraction";
+
+const KIND_COPY: Record<ModelKind, { badge: string; countNoun: string; toggle: string }> = {
+  embedding: { badge: "EMBEDDING", countNoun: "can embed", toggle: "Show non-embedding" },
+  extraction: { badge: "CHAT", countNoun: "can run extraction", toggle: "Show speech and guard models" }
+};
 
 interface ModelPickerModalProps {
-  provider: EmbeddingProvider;
+  kind: ModelKind;
+  provider: EmbeddingProvider | ExtractionProvider;
   baseUrl: string;
   /** Empty when the caller wants the backend to use the key it already stores. */
   apiKey: string;
@@ -12,8 +28,9 @@ interface ModelPickerModalProps {
 }
 
 const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
-  provider, baseUrl, apiKey, currentModel, onSelect, onClose
+  kind, provider, baseUrl, apiKey, currentModel, onSelect, onClose
 }) => {
+  const copy = KIND_COPY[kind];
   const [models, setModels] = useState<ProviderModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -25,19 +42,23 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
     setLoading(true);
     setError(null);
 
-    listProviderModels({ provider, baseUrl, apiKey: apiKey || undefined })
+    const request = kind === "extraction"
+      ? listExtractionModels({ provider: provider as ExtractionProvider, baseUrl, apiKey: apiKey || undefined })
+      : listProviderModels({ provider: provider as EmbeddingProvider, baseUrl, apiKey: apiKey || undefined });
+
+    request
       .then(data => {
         if (cancelled) return;
         setModels(data.models);
-        // Providers list far more chat models than embedding ones. Only fall
-        // back to the full list when nothing embeddable was detected.
-        setShowAll(!data.models.some(m => m.embedding));
+        // Providers list plenty the picked job cannot use. Only fall back to
+        // the full list when nothing suitable was detected at all.
+        setShowAll(!data.models.some(m => m.suitable));
       })
       .catch(err => { if (!cancelled) setError(extractErrorMessage(err)); })
       .finally(() => { if (!cancelled) setLoading(false); });
 
     return () => { cancelled = true; };
-  }, [provider, baseUrl, apiKey]);
+  }, [kind, provider, baseUrl, apiKey]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -45,12 +66,12 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const embeddingCount = useMemo(() => models.filter(m => m.embedding).length, [models]);
+  const suitableCount = useMemo(() => models.filter(m => m.suitable).length, [models]);
 
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return models
-      .filter(m => showAll || m.embedding)
+      .filter(m => showAll || m.suitable)
       .filter(m => !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q));
   }, [models, showAll, filter]);
 
@@ -77,7 +98,7 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
                 Select a model
               </h2>
               <p style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "4px" }}>
-                {loading ? "Asking the provider what it can run…" : `${models.length} available, ${embeddingCount} can embed.`}
+                {loading ? "Asking the provider what it can run…" : `${models.length} available, ${suitableCount} ${copy.countNoun}.`}
               </p>
             </div>
             <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: "22px", lineHeight: 1, padding: 0 }}>×</button>
@@ -93,7 +114,7 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
             />
             <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px", color: "var(--text-secondary)", cursor: "pointer", whiteSpace: "nowrap" }}>
               <input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)} style={{ cursor: "pointer" }} />
-              Show non-embedding
+              {copy.toggle}
             </label>
           </div>
         </div>
@@ -108,7 +129,7 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
             <div style={{ background: "rgba(239, 68, 68, 0.08)", border: "1px solid rgba(239, 68, 68, 0.2)", borderRadius: "10px", padding: "16px", color: "var(--danger)", fontSize: "13px", fontWeight: 600 }}>
               {error}
               <p style={{ color: "var(--text-secondary)", fontWeight: 400, fontSize: "12px", marginTop: "8px", lineHeight: 1.5 }}>
-                {provider === "gemini"
+                {provider === "gemini" || provider === "groq"
                   ? "Paste a valid API key in the form behind this dialog, then try again."
                   : "Check the base URL and key, then try again."}
               </p>
@@ -134,9 +155,9 @@ const ModelPickerModal: React.FC<ModelPickerModalProps> = ({
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", justifyContent: "space-between" }}>
                     <span style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>{model.label}</span>
                     <span style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
-                      {model.embedding && (
+                      {model.suitable && (
                         <span style={{ fontSize: "9px", fontWeight: 800, letterSpacing: "0.05em", color: "var(--success)", border: "1px solid rgba(16, 185, 129, 0.3)", borderRadius: "4px", padding: "2px 6px" }}>
-                          EMBEDDING
+                          {copy.badge}
                         </span>
                       )}
                       {active && <span style={{ fontSize: "9px", fontWeight: 800, color: "var(--primary)" }}>CURRENT</span>}

@@ -5,12 +5,33 @@ import {
   extractErrorMessage,
   fetchSessions,
   testEmbeddingProvider,
+  testExtractionProvider,
   reindexEmbeddings,
   type EmbeddingProvider,
   type EmbeddingSettings,
+  type ExtractionProvider,
+  type ExtractionSettings,
   type ProviderModel
 } from "../api/ArcRift";
-import ModelPickerModal from "./ModelPickerModal";
+import ModelPickerModal, { type ModelKind } from "./ModelPickerModal";
+
+const EXTRACTION_LABELS: Record<ExtractionProvider, string> = {
+  ollama: "Ollama (local)",
+  groq: "Groq",
+  "local-openai": "LM Studio / LocalAI"
+};
+
+const EXTRACTION_HINTS: Record<ExtractionProvider, string> = {
+  ollama: "Runs on this machine. Slower on modest hardware, but nothing leaves the host.",
+  groq: "Hosted and fast. PII-scrubbed conversation text is sent to Groq.",
+  "local-openai": "Any local server speaking the OpenAI chat API, such as LM Studio."
+};
+
+const EXTRACTION_DEFAULTS: Record<ExtractionProvider, { baseUrl: string; model: string }> = {
+  ollama: { baseUrl: "http://localhost:11434", model: "llama3.1:8b" },
+  groq: { baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  "local-openai": { baseUrl: "http://localhost:1234/v1", model: "local-model" }
+};
 
 // Applied when switching provider, so the previous provider's endpoint does not
 // linger in the form and get saved against a backend that cannot use it.
@@ -64,6 +85,18 @@ const SettingsView: React.FC = () => {
   const [apiKeyTouched, setApiKeyTouched] = useState(false);
   const [indexState, setIndexState] = useState<{ provider: string; model: string; stale: boolean } | null>(null);
 
+  // Extraction backend. Provider null means nothing was chosen and the backend
+  // still probes, which is what every install did before this was settable.
+  const [extraction, setExtraction] = useState<ExtractionSettings | null>(null);
+  const [xProvider, setXProvider] = useState<ExtractionProvider | "">("");
+  const [xBaseUrl, setXBaseUrl] = useState("");
+  const [xModel, setXModel] = useState("");
+  const [xApiKey, setXApiKey] = useState("");
+  const [xApiKeyTouched, setXApiKeyTouched] = useState(false);
+  const [xTesting, setXTesting] = useState(false);
+  const [xTestResult, setXTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  const [pickerKind, setPickerKind] = useState<ModelKind>("embedding");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -94,6 +127,28 @@ const SettingsView: React.FC = () => {
     setTestResult(null);
   };
 
+  const applyExtraction = (next: ExtractionSettings) => {
+    setExtraction(next);
+    setXProvider(next.provider || "");
+    setXBaseUrl(next.baseUrl);
+    setXModel(next.model);
+    setXApiKey("");
+    setXApiKeyTouched(false);
+  };
+
+  const handleExtractionProviderChange = (next: ExtractionProvider | "") => {
+    setXProvider(next);
+    setXTestResult(null);
+    if (!next) return;
+    if (extraction && next === extraction.provider) {
+      setXBaseUrl(extraction.baseUrl);
+      setXModel(extraction.model);
+    } else {
+      setXBaseUrl(EXTRACTION_DEFAULTS[next].baseUrl);
+      setXModel(EXTRACTION_DEFAULTS[next].model);
+    }
+  };
+
   const applyEmbedding = (next: EmbeddingSettings) => {
     setEmbedding(next);
     setProvider(next.provider);
@@ -122,6 +177,7 @@ const SettingsView: React.FC = () => {
       });
 
       if (data.embedding) applyEmbedding(data.embedding);
+      if (data.extraction) applyExtraction(data.extraction);
       setIndexState(data.index);
 
       const sessionData = await fetchSessions();
@@ -200,6 +256,53 @@ const SettingsView: React.FC = () => {
     }
   };
 
+  const extractionDirty =
+    !!extraction &&
+    ((xProvider || null) !== extraction.provider ||
+      xBaseUrl !== extraction.baseUrl ||
+      xModel !== extraction.model ||
+      xApiKeyTouched);
+
+  const handleSaveExtraction = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    setSuccessMessage(null);
+    setXTestResult(null);
+    try {
+      const result = await updateSettings({
+        extractionProvider: xProvider || null,
+        extractionBaseUrl: xBaseUrl,
+        extractionModel: xModel,
+        ...(xApiKeyTouched ? { extractionApiKey: xApiKey } : {})
+      });
+      applyExtraction(result.extraction);
+      setSuccessMessage("Extraction backend saved.");
+    } catch (err) {
+      setError(`Failed to save extraction backend: ${extractErrorMessage(err)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestExtraction = async () => {
+    setXTesting(true);
+    setXTestResult(null);
+    try {
+      const result = await testExtractionProvider();
+      setXTestResult({
+        ok: result.tripleCount > 0,
+        message: result.tripleCount > 0
+          ? `${result.model} extracted ${result.tripleCount} fact(s) in ${result.latencyMs}ms.`
+          : `${result.model} answered in ${result.latencyMs}ms but produced no facts — it may be too small for extraction.`
+      });
+    } catch (err) {
+      setXTestResult({ ok: false, message: extractErrorMessage(err) });
+    } finally {
+      setXTesting(false);
+    }
+  };
+
   const handleTestProvider = async () => {
     setTesting(true);
     setTestResult(null);
@@ -257,13 +360,14 @@ const SettingsView: React.FC = () => {
     <div style={{ maxWidth: "800px", margin: "100px auto 40px auto", padding: "0 24px" }}>
       {pickerOpen && (
         <ModelPickerModal
-          provider={provider}
-          baseUrl={baseUrl}
+          kind={pickerKind}
+          provider={pickerKind === "extraction" ? (xProvider || "ollama") : provider}
+          baseUrl={pickerKind === "extraction" ? xBaseUrl : baseUrl}
           // Only pass a key the user just typed; otherwise the backend uses the
           // one it already holds, which never reaches the browser.
-          apiKey={apiKeyTouched ? apiKey : ""}
-          currentModel={embeddingModel}
-          onSelect={handleModelPicked}
+          apiKey={pickerKind === "extraction" ? (xApiKeyTouched ? xApiKey : "") : (apiKeyTouched ? apiKey : "")}
+          currentModel={pickerKind === "extraction" ? xModel : embeddingModel}
+          onSelect={pickerKind === "extraction" ? (m) => { setXModel(m.id); setXTestResult(null); } : handleModelPicked}
           onClose={() => setPickerOpen(false)}
         />
       )}
@@ -321,7 +425,7 @@ const SettingsView: React.FC = () => {
             cursor: "pointer", transition: "all 0.2s", display: "flex", alignItems: "center", gap: "8px"
           }}
         >
-          Embedding Provider
+          Providers
           {indexState?.stale && (
             <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--danger)", boxShadow: "0 0 6px var(--danger)" }} />
           )}
@@ -531,7 +635,7 @@ const SettingsView: React.FC = () => {
             />
             <button
               type="button"
-              onClick={() => setPickerOpen(true)}
+              onClick={() => { setPickerKind("embedding"); setPickerOpen(true); }}
               style={{ padding: "12px 20px", borderRadius: "10px", fontSize: "13px", fontWeight: 700, background: "transparent", color: "var(--text-secondary)", border: "1px solid var(--border-main)", cursor: "pointer", whiteSpace: "nowrap" }}
             >
               Browse…
@@ -630,6 +734,143 @@ const SettingsView: React.FC = () => {
               }}
             >
               {saving ? "Saving…" : "Save Provider"}
+            </button>
+          </div>
+        </div>
+      </form>
+      )}
+
+      {activeTab === "providers" && (
+      <form onSubmit={handleSaveExtraction} style={{ background: "var(--surface)", border: "1px solid var(--border-main)", borderRadius: "16px", backdropFilter: "var(--surface-blur)", padding: "32px", marginTop: "24px", display: "flex", flexDirection: "column", gap: "28px" }}>
+
+        <div>
+          <h2 style={{ fontFamily: "'Outfit', sans-serif", fontSize: "20px", fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>
+            Extraction LLM
+          </h2>
+          <p style={{ fontSize: "13px", color: "var(--text-secondary)", lineHeight: 1.5, marginTop: "6px" }}>
+            Reads saved conversations and pulls out the entities and relationships that build the knowledge graph.
+          </p>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Backend</label>
+          <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+            {xProvider
+              ? EXTRACTION_HINTS[xProvider]
+              : `Detect picks the first backend that answers, preferring local. Currently resolving to ${extraction?.resolvedProvider ?? "unknown"}.`}
+          </p>
+          <select
+            className="settings-select"
+            value={xProvider}
+            onChange={(e) => handleExtractionProviderChange(e.target.value as ExtractionProvider | "")}
+            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none", cursor: "pointer" }}
+          >
+            <option value="">Detect automatically</option>
+            {(extraction?.providers || []).map((p) => (
+              <option key={p} value={p}>{EXTRACTION_LABELS[p] || p}</option>
+            ))}
+          </select>
+        </div>
+
+        {xProvider && (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Model</label>
+              <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+                Extraction needs a model that follows instructions closely. Very small models tend to return no facts at all.
+              </p>
+              <div style={{ display: "flex", gap: "12px" }}>
+                <input
+                  value={xModel}
+                  onChange={(e) => setXModel(e.target.value)}
+                  placeholder="llama-3.3-70b-versatile"
+                  style={{ flex: 1, padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+                />
+                <button
+                  type="button"
+                  onClick={() => { setPickerKind("extraction"); setPickerOpen(true); }}
+                  style={{ padding: "12px 20px", borderRadius: "10px", fontSize: "13px", fontWeight: 700, background: "transparent", color: "var(--text-secondary)", border: "1px solid var(--border-main)", cursor: "pointer", whiteSpace: "nowrap" }}
+                >
+                  Browse…
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Base URL</label>
+              <input
+                value={xBaseUrl}
+                onChange={(e) => setXBaseUrl(e.target.value)}
+                style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+              />
+            </div>
+
+            {xProvider === "groq" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)", display: "flex", justifyContent: "space-between" }}>
+                  <span>API Key</span>
+                  {extraction?.apiKeySet && !xApiKeyTouched && (
+                    <span style={{ fontSize: "11px", fontWeight: 500, color: "var(--success)" }}>Stored: {extraction.apiKeyHint}</span>
+                  )}
+                </label>
+                <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+                  Held on this machine and never sent to the browser. Leave blank to keep the stored key, which may come from GROQ_API_KEY.
+                </p>
+                <input
+                  type="password"
+                  value={xApiKey}
+                  onChange={(e) => { setXApiKey(e.target.value); setXApiKeyTouched(true); }}
+                  placeholder={extraction?.apiKeySet ? "•••••••• (unchanged)" : "Paste your key"}
+                  autoComplete="off"
+                  style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+                />
+              </div>
+            )}
+          </>
+        )}
+
+        {xTestResult && (
+          <div style={{ background: xTestResult.ok ? "rgba(16, 185, 129, 0.08)" : "rgba(239, 68, 68, 0.08)", border: `1px solid ${xTestResult.ok ? "rgba(16, 185, 129, 0.2)" : "rgba(239, 68, 68, 0.2)"}`, borderRadius: "10px", padding: "14px", fontSize: "13px", color: xTestResult.ok ? "var(--success)" : "var(--danger)", fontWeight: 600 }}>
+            {xTestResult.message}
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid var(--border-main)", paddingTop: "24px", gap: "16px" }}>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            {extractionDirty && (
+              <span style={{ color: "var(--primary)", fontSize: "12px", fontWeight: 500 }}>Unsaved changes detected.</span>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+            <button
+              type="button"
+              onClick={handleTestExtraction}
+              disabled={xTesting || extractionDirty}
+              title={extractionDirty ? "Save your changes first — the test uses the stored configuration" : undefined}
+              style={{
+                padding: "12px 20px", borderRadius: "10px", fontSize: "13px", fontWeight: 700,
+                background: "transparent", color: extractionDirty ? "var(--text-dim)" : "var(--text-secondary)",
+                border: "1px solid var(--border-main)", cursor: xTesting || extractionDirty ? "not-allowed" : "pointer"
+              }}
+            >
+              {xTesting ? "Extracting…" : "Test extraction"}
+            </button>
+
+            <button
+              type="submit"
+              disabled={!extractionDirty || saving}
+              style={{
+                padding: "12px 28px", borderRadius: "10px", fontSize: "14px", fontWeight: 700,
+                cursor: extractionDirty && !saving ? "pointer" : "not-allowed",
+                background: extractionDirty ? "var(--primary)" : "rgba(255,255,255,0.05)",
+                color: extractionDirty ? "white" : "var(--text-dim)",
+                border: extractionDirty ? "1px solid transparent" : "1px solid var(--border-dim)",
+                boxShadow: extractionDirty ? "0 0 15px var(--primary-glow)" : "none",
+                transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)"
+              }}
+            >
+              {saving ? "Saving…" : "Save Extraction"}
             </button>
           </div>
         </div>

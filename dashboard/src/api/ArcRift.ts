@@ -91,6 +91,19 @@ export interface EmbeddingSettings {
   apiKeyHint: string;
 }
 
+export type ExtractionProvider = "ollama" | "groq" | "local-openai";
+
+export interface ExtractionSettings {
+  providers: ExtractionProvider[];
+  /** Null when nothing was chosen and the backend still probes for one. */
+  provider: ExtractionProvider | null;
+  resolvedProvider: string;
+  baseUrl: string;
+  model: string;
+  apiKeySet: boolean;
+  apiKeyHint: string;
+}
+
 export async function fetchSettings() {
   const res = await apiClient.get("/api/settings");
   return res.data as {
@@ -100,6 +113,7 @@ export async function fetchSettings() {
     activeExtractionModel: string;
     contextMode: string;
     embedding: EmbeddingSettings;
+    extraction: ExtractionSettings;
     index: { provider: string; model: string; dimension: number; stale: boolean } | null;
   };
 }
@@ -114,9 +128,19 @@ export async function updateSettings(data: {
   embeddingApiKey?: string;
   embeddingModel?: string;
   embeddingDimension?: number;
+  /** Null hands the choice back to the backend's probe. */
+  extractionProvider?: ExtractionProvider | null;
+  extractionBaseUrl?: string;
+  extractionApiKey?: string;
+  extractionModel?: string;
 }) {
   const res = await apiClient.post("/api/settings", data);
-  return res.data as { success: boolean; embedding: EmbeddingSettings; reindexRequired: boolean };
+  return res.data as {
+    success: boolean;
+    embedding: EmbeddingSettings;
+    extraction: ExtractionSettings;
+    reindexRequired: boolean;
+  };
 }
 
 export async function testEmbeddingProvider() {
@@ -136,7 +160,8 @@ export interface ProviderModel {
   label: string;
   description?: string;
   dimension?: number;
-  embedding: boolean;
+  /** False when the provider lists the model but it cannot do this job. */
+  suitable: boolean;
 }
 
 /**
@@ -150,6 +175,26 @@ export async function listProviderModels(body: {
 }) {
   const res = await apiClient.post("/api/settings/embedding/models", body);
   return res.data as { success: boolean; provider: EmbeddingProvider; models: ProviderModel[] };
+}
+
+export async function listExtractionModels(body: {
+  provider?: ExtractionProvider;
+  baseUrl?: string;
+  apiKey?: string;
+}) {
+  const res = await apiClient.post("/api/settings/extraction/models", body);
+  return res.data as { success: boolean; provider: ExtractionProvider; models: ProviderModel[] };
+}
+
+export async function testExtractionProvider() {
+  const res = await apiClient.post("/api/settings/extraction/test");
+  return res.data as {
+    success: boolean;
+    provider: string;
+    model: string;
+    tripleCount: number;
+    latencyMs: number;
+  };
 }
 
 export async function reindexEmbeddings() {

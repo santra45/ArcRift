@@ -313,7 +313,7 @@ export interface ProviderModel {
   /** Dimension the provider advertises, when it says. */
   dimension?: number;
   /** False for models the provider lists but cannot embed with. */
-  embedding: boolean;
+  suitable: boolean;
 }
 
 /**
@@ -348,7 +348,7 @@ export async function listProviderModels(override?: {
         // Gemini reports this only on some models; absent means "ask for what
         // you want" rather than "fixed width".
         dimension: typeof m.outputDimensionality === "number" ? m.outputDimensionality : undefined,
-        embedding: methods.includes("embedContent") || methods.includes("batchEmbedContents")
+        suitable: methods.includes("embedContent") || methods.includes("batchEmbedContents")
       };
     });
   }
@@ -370,7 +370,7 @@ export async function listProviderModels(override?: {
         id,
         label: id,
         // No capability field in this API, so the name is the only signal.
-        embedding: /embed/i.test(id)
+        suitable: /embed/i.test(id)
       };
     });
   }
@@ -387,7 +387,7 @@ export async function listProviderModels(override?: {
       label: id,
       // Ollama does not say which models embed, so the name is the only signal
       // and anything unmatched is still offered, just not promoted.
-      embedding: /embed/i.test(id)
+      suitable: /embed/i.test(id)
     };
   });
 }
