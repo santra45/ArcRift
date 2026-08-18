@@ -152,7 +152,21 @@ function createTables() {
       embedding float[768]
     )
   `);
-  
+
+  // What the vectors above were produced with.
+  // Two models put the same text in completely different places, so an index
+  // read back under a different one returns confident nonsense. Retrieval
+  // compares the live settings against this row and refuses on a mismatch.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS index_meta (
+      id TEXT PRIMARY KEY DEFAULT 'singleton',
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      dimension INTEGER NOT NULL,
+      updatedAt TEXT
+    )
+  `);
+
   // Metadata for chunks (since vec0 is just for search)
   db.exec(`
     CREATE TABLE IF NOT EXISTS chunk_metadata (

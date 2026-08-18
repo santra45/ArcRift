@@ -2,6 +2,7 @@ import { getSqlite } from "./sqlite";
 import { IVectorStore, RetrievedChunk } from "./storage.types";
 import { WindowChunk } from "./chunker";
 import { generateEmbedding, generateEmbeddings } from "./embeddings";
+import { assertIndexMatchesSettings } from "./index-fingerprint";
 import { logger } from "../utils/logger";
 import { generateHyDEAnswer } from "./hyde";
 
@@ -183,6 +184,9 @@ export class SqliteVectorStore implements IVectorStore {
   }
 
   async retrieveRelevantChunks(query: string, sessionId: string, topN = 3, keywords: string[] = []): Promise<RetrievedChunk[]> {
+    // Stored vectors are only comparable to a query embedded the same way.
+    assertIndexMatchesSettings();
+
     const hydeAnswer = await generateHyDEAnswer(query);
     const augmentedQuery = `${query}\n${hydeAnswer}`;
 
@@ -294,10 +298,13 @@ export class SqliteVectorStore implements IVectorStore {
   }
 
   async hybridSearch(query: string, sessionId: string, topN = 3): Promise<RetrievedChunk[]> {
+    assertIndexMatchesSettings();
     return this.retrieveRelevantChunks(query, sessionId, topN);
   }
 
   async retrieveGlobalChunks(query: string, topN = 3, keywords: string[] = []): Promise<RetrievedChunk[]> {
+    assertIndexMatchesSettings();
+
     const words = query.trim().split(/\s+/).filter(w => w.length > 0);
     const isSingleWord = words.length <= 1;
     const candidates = new Map<string, { chunkIndex: number, sentences: Set<string>, maxScore: number, sessionId: string }>();

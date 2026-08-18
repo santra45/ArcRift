@@ -3,6 +3,8 @@
 import { Router, Request, Response } from "express";
 import { vectorStore, graphStore, sessionStore, RetrievedChunk } from "../services/storage";
 import { extractEntitiesFromQuery, summarizeContext } from "../services/extractor";
+import { IndexFingerprintMismatchError } from "../services/index-fingerprint";
+import { reindexEmbeddings } from "../services/reindex";
 import { logger } from "../utils/logger";
 import { wrapInContextBlock, sanitizeChunks } from "../middleware/sanitize";
 import { isValidObjectId } from "../utils/validators";
@@ -63,6 +65,19 @@ function buildBudgetedContext(
 }
 
 const router = Router();
+
+/**
+ * A stale index is the caller's to fix, not a server fault — the message names
+ * the change and the rebuild, so it is worth passing through instead of
+ * flattening into the generic 500.
+ */
+function sendRetrievalError(res: Response, err: unknown, fallback: string): void {
+  if (err instanceof IndexFingerprintMismatchError) {
+    res.status(409).json({ error: err.message, reindexRequired: true });
+    return;
+  }
+  res.status(500).json({ error: fallback });
+}
 
 // POST /api/rag/retrieve
 router.post("/retrieve", async (req: Request, res: Response) => {
@@ -165,7 +180,7 @@ router.post("/retrieve", async (req: Request, res: Response) => {
     });
   } catch (err) {
     logger.error("RAG error:", err);
-    res.status(500).json({ error: "Failed to retrieve context" });
+    sendRetrievalError(res, err, "Failed to retrieve context");
   }
 });
 
@@ -236,7 +251,21 @@ router.post("/global", async (req: Request, res: Response) => {
     });
   } catch (err) {
     logger.error("Global RAG error:", err);
-    res.status(500).json({ error: "Failed to retrieve global context" });
+    sendRetrievalError(res, err, "Failed to retrieve global context");
+  }
+});
+
+// POST /api/rag/reindex — re-embed every stored chunk and sentence with the
+// embedding backend currently configured, then stamp the index with it.
+router.post("/reindex", async (_req: Request, res: Response) => {
+  try {
+    const result = await reindexEmbeddings();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error("Re-index error:", err);
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to rebuild the embedding index"
+    });
   }
 });
 
