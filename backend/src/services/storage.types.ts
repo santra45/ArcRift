@@ -147,12 +147,61 @@ export interface WorkingMemory {
   updatedAt: Date;
 }
 
+/** A typed link from one memory to another, e.g. "replaces" or "caused_by". */
+export interface MemoryRelation {
+  id: string;
+  sourceMemoryId: string;
+  targetMemoryId: string;
+  relationType: string;
+  reason?: string;
+  strength: number;
+  confidence: number;
+  bidirectional: boolean;
+  status: "active" | "suggested";
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** One step of an evolution chain, as returned by getEvolutionChain. */
+export interface MemoryRevision {
+  id: string;
+  title: string;
+  unitType: string;
+  isLatest: boolean;
+  createdAt: string;
+  evolvesFromId?: string;
+  evolvesRelation?: string;
+}
+
 export interface IMemoryStore {
   createMemory(memory: Partial<Memory> & { content: string; sessionId: string }): Promise<Memory>;
-  getMemories(sessionId?: string, filters?: { importance?: string | number; category?: string; query?: string; unitType?: string; limit?: number }): Promise<Memory[]>;
+  /** Returns only the latest revision of each claim unless `includeSuperseded` is set. */
+  getMemories(sessionId?: string, filters?: { importance?: string | number; category?: string; query?: string; unitType?: string; limit?: number; includeSuperseded?: boolean }): Promise<Memory[]>;
   getMemory(id: string): Promise<Memory | null>;
   updateMemory(id: string, update: Partial<Memory>): Promise<Memory | null>;
   deleteMemory(id: string): Promise<boolean>;
+
+  // Memory Relations
+  addRelation(relation: {
+    sourceMemoryId: string;
+    targetMemoryId: string;
+    relationType: string;
+    reason?: string;
+    strength?: number;
+    confidence?: number;
+    bidirectional?: boolean;
+    status?: "active" | "suggested";
+  }): Promise<MemoryRelation>;
+  listRelations(memoryId: string, options?: { direction?: "out" | "in" | "both"; relationTypes?: string[]; status?: string; limit?: number }): Promise<MemoryRelation[]>;
+  deleteRelation(relationId: string): Promise<boolean>;
+
+  // Memory Evolution
+  getEvolutionChain(memoryId: string, maxDepth?: number): Promise<{ chain: MemoryRevision[]; position: number; totalVersions: number }>;
+  supersedeMemory(oldMemoryId: string, newMemoryId: string, reason?: string): Promise<{
+    status: string;
+    oldMemory: { id: string; isLatest: boolean };
+    newMemory: { id: string; isLatest: boolean; evolvesFromId: string };
+  }>;
 
   // Working Memory
   getWorkingMemory(sessionId: string): Promise<WorkingMemory | null>;

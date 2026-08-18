@@ -379,6 +379,11 @@ class UnsupportedMemoryStore implements IMemoryStore {
   async getMemory(): Promise<never> { return this.unsupported(); }
   async updateMemory(): Promise<never> { return this.unsupported(); }
   async deleteMemory(): Promise<never> { return this.unsupported(); }
+  async addRelation(): Promise<never> { return this.unsupported(); }
+  async listRelations(): Promise<never> { return this.unsupported(); }
+  async deleteRelation(): Promise<never> { return this.unsupported(); }
+  async getEvolutionChain(): Promise<never> { return this.unsupported(); }
+  async supersedeMemory(): Promise<never> { return this.unsupported(); }
   async getWorkingMemory(): Promise<never> { return this.unsupported(); }
   async saveWorkingMemory(): Promise<never> { return this.unsupported(); }
 }

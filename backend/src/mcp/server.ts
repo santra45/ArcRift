@@ -39,6 +39,11 @@ import { getSummary } from "./tools/summary";
 import { identifyProject } from "./tools/detector";
 import { indexCodebase } from "./tools/index_codebase";
 import { getWorkingMemory, updateWorkingMemory } from "./tools/working_memory";
+import { memorySupersede } from "./tools/memory_supersede";
+import { memoryEvolvesChain } from "./tools/memory_evolves_chain";
+import { memoryRelationAdd } from "./tools/memory_relation_add";
+import { memoryRelationList } from "./tools/memory_relation_list";
+import { memoryRelationDelete } from "./tools/memory_relation_delete";
 import { initStorage, sessionStore } from "../services/storage";
 import { logger } from "../utils/logger";
 
@@ -181,6 +186,80 @@ const TOOLS = [
       },
       required: ["project"],
     },
+  },
+  {
+    name: "memory_supersede",
+    description:
+      "Record that one memory replaced another. The old memory stops being returned by " +
+      "ordinary reads but stays readable as history. Use this when a fact changes rather " +
+      "than storing a second, contradictory memory.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        old_memory_id: { type: "string", description: "The memory that is now out of date" },
+        new_memory_id: { type: "string", description: "The memory that replaces it" },
+        reason: { type: "string", description: "Why the claim changed" },
+      },
+      required: ["old_memory_id", "new_memory_id"],
+    },
+  },
+  {
+    name: "memory_evolves_chain",
+    description:
+      "List every revision of a claim in order, oldest first, including the superseded ones.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        memory_id: { type: "string", description: "Any memory in the chain" },
+        max_depth: { type: "number", description: "How far to walk in each direction (default 10)" },
+      },
+      required: ["memory_id"],
+    },
+  },
+  {
+    name: "memory_relation_add",
+    description:
+      "Link two memories with a named relation, e.g. 'caused_by', 'refines' or 'contradicts'.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        source_memory_id: { type: "string", description: "The memory the link starts from" },
+        target_memory_id: { type: "string", description: "The memory the link points at" },
+        relation_type: { type: "string", description: "Name of the relation" },
+        reason: { type: "string", description: "Why the two are linked" },
+        strength: { type: "number", description: "0–1, how strong the link is (default 1)" },
+        confidence: { type: "number", description: "0–1, how sure the link is (default 1)" },
+        bidirectional: { type: "boolean", description: "Whether the link reads both ways (default false)" },
+        status: { type: "string", description: "'active' for a settled link, 'suggested' for a proposal" },
+      },
+      required: ["source_memory_id", "target_memory_id", "relation_type"],
+    },
+  },
+  {
+    name: "memory_relation_list",
+    description: "List the typed links into and out of one memory.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        memory_id: { type: "string", description: "The memory to list relations for" },
+        direction: { type: "string", description: "'out', 'in' or 'both' (default both)" },
+        relation_types: { type: "array", items: { type: "string" }, description: "Only these relation names" },
+        status: { type: "string", description: "'active' (default) or 'suggested'" },
+        limit: { type: "number", description: "Max relations to return (default 50)" },
+      },
+      required: ["memory_id"],
+    },
+  },
+  {
+    name: "memory_relation_delete",
+    description: "Remove a single typed link. The memories it joined are left in place.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        relation_id: { type: "string", description: "ID of the relation to remove" },
+      },
+      required: ["relation_id"],
+    },
   }
 ];
 
@@ -290,6 +369,48 @@ server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolRes
           args.activeDecisions as string[] | undefined,
           args.blockers as string[] | undefined
         );
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "memory_supersede": {
+        const result = await memorySupersede(
+          args.old_memory_id as string,
+          args.new_memory_id as string,
+          args.reason as string | undefined
+        );
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "memory_evolves_chain": {
+        const result = await memoryEvolvesChain(
+          args.memory_id as string,
+          args.max_depth as number | undefined
+        );
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "memory_relation_add": {
+        const result = await memoryRelationAdd(
+          args.source_memory_id as string,
+          args.target_memory_id as string,
+          args.relation_type as string,
+          args.reason as string | undefined,
+          args.strength as number | undefined,
+          args.confidence as number | undefined,
+          args.bidirectional as boolean | undefined,
+          args.status as "active" | "suggested" | undefined
+        );
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "memory_relation_list": {
+        const result = await memoryRelationList(
+          args.memory_id as string,
+          args.direction as "out" | "in" | "both" | undefined,
+          args.relation_types as string[] | undefined,
+          args.status as string | undefined,
+          args.limit as number | undefined
+        );
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "memory_relation_delete": {
+        const result = await memoryRelationDelete(args.relation_id as string);
         return { content: [{ type: "text", text: result }] };
       }
       default:

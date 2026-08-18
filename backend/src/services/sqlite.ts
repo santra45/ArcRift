@@ -280,6 +280,30 @@ function createTables() {
     )
   `);
 
+  // Typed links between memories, including the "replaces" edge a supersede
+  // records. Both ends cascade so deleting a memory cannot leave a relation
+  // pointing at a row that is no longer there.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_relations (
+      id TEXT PRIMARY KEY,
+      source_memory_id TEXT NOT NULL,
+      target_memory_id TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      reason TEXT,
+      strength REAL DEFAULT 1.0,
+      confidence REAL DEFAULT 1.0,
+      bidirectional INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'active',
+      createdAt TEXT,
+      updatedAt TEXT,
+      FOREIGN KEY(source_memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+      FOREIGN KEY(target_memory_id) REFERENCES memories(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_source ON memory_relations(source_memory_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_target ON memory_relations(target_memory_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_type ON memory_relations(relation_type)");
+
   migrateInvalidSessionIds();
 
   logger.success("All SQLite tables initialized successfully");

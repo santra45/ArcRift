@@ -178,6 +178,248 @@ describe("SqliteMemoryStore", () => {
     });
   });
 
+  describe("memory relations", () => {
+    let relationSessionId: string;
+    let symptomId: string;
+    let fixId: string;
+
+    beforeAll(async () => {
+      const session = await sessionStore.createSession("Relations Project", "chrome");
+      relationSessionId = session._id;
+
+      symptomId = (await memoryStore.createMemory({
+        sessionId: relationSessionId,
+        content: "The API returns 429 under load."
+      })).id;
+      fixId = (await memoryStore.createMemory({
+        sessionId: relationSessionId,
+        content: "Requests are batched to stay under the rate limit."
+      })).id;
+    });
+
+    it("adds, lists and deletes a typed link", async () => {
+      const relation = await memoryStore.addRelation({
+        sourceMemoryId: fixId,
+        targetMemoryId: symptomId,
+        relationType: "caused_by",
+        reason: "The batching exists because of the 429s."
+      });
+
+      expect(relation.relationType).toBe("caused_by");
+      expect(relation.strength).toBe(1);
+      expect(relation.confidence).toBe(1);
+      expect(relation.bidirectional).toBe(false);
+      expect(relation.status).toBe("active");
+
+      // The same link is outgoing at one end and incoming at the other.
+      expect((await memoryStore.listRelations(fixId, { direction: "out" })).map(r => r.id)).toEqual([relation.id]);
+      expect((await memoryStore.listRelations(symptomId, { direction: "in" })).map(r => r.id)).toEqual([relation.id]);
+      expect((await memoryStore.listRelations(symptomId)).map(r => r.id)).toEqual([relation.id]);
+      expect(await memoryStore.listRelations(symptomId, { direction: "out" })).toEqual([]);
+
+      expect(await memoryStore.deleteRelation(relation.id)).toBe(true);
+      expect(await memoryStore.listRelations(fixId)).toEqual([]);
+      expect(await memoryStore.deleteRelation(relation.id)).toBe(false);
+    });
+
+    it("filters by relation type", async () => {
+      const refines = await memoryStore.addRelation({
+        sourceMemoryId: fixId, targetMemoryId: symptomId, relationType: "refines"
+      });
+      const contradicts = await memoryStore.addRelation({
+        sourceMemoryId: fixId, targetMemoryId: symptomId, relationType: "contradicts"
+      });
+
+      const matched = await memoryStore.listRelations(fixId, { relationTypes: ["contradicts"] });
+      expect(matched.map(r => r.id)).toEqual([contradicts.id]);
+
+      await memoryStore.deleteRelation(refines.id);
+      await memoryStore.deleteRelation(contradicts.id);
+    });
+
+    it("removes a memory's relations along with the memory", async () => {
+      const doomed = await memoryStore.createMemory({
+        sessionId: relationSessionId,
+        content: "Linked to by something that outlives it."
+      });
+      const relation = await memoryStore.addRelation({
+        sourceMemoryId: symptomId,
+        targetMemoryId: doomed.id,
+        relationType: "refines"
+      });
+
+      await memoryStore.deleteMemory(doomed.id);
+
+      const remaining = db.prepare("SELECT COUNT(*) n FROM memory_relations WHERE id = ?").get(relation.id);
+      expect(remaining.n).toBe(0);
+    });
+  });
+
+  describe("memory evolution", () => {
+    let evolutionSessionId: string;
+
+    const remember = (content: string) =>
+      memoryStore.createMemory({ sessionId: evolutionSessionId, content });
+
+    beforeAll(async () => {
+      const session = await sessionStore.createSession("Evolution Project", "chrome");
+      evolutionSessionId = session._id;
+    });
+
+    it("retires the old memory and links its replacement", async () => {
+      const older = await remember("Deploys go out on Fridays.");
+      const newer = await remember("Deploys go out on Tuesdays.");
+
+      const result = await memoryStore.supersedeMemory(older.id, newer.id, "Friday deploys kept breaking.");
+      expect(result.status).toBe("superseded");
+
+      expect((await memoryStore.getMemory(older.id))?.isLatest).toBe(false);
+
+      const current = await memoryStore.getMemory(newer.id);
+      expect(current?.isLatest).toBe(true);
+      expect(current?.evolvesFromId).toBe(older.id);
+      expect(current?.evolvesRelation).toBe("replaces");
+
+      // The supersede is recorded as a typed link too.
+      const links = await memoryStore.listRelations(newer.id, { direction: "out" });
+      expect(links).toHaveLength(1);
+      expect(links[0].relationType).toBe("replaces");
+      expect(links[0].targetMemoryId).toBe(older.id);
+      expect(links[0].reason).toBe("Friday deploys kept breaking.");
+    });
+
+    it("refuses a supersede that names a missing memory or itself", async () => {
+      const current = await remember("Nothing has replaced this yet.");
+
+      await expect(memoryStore.supersedeMemory("mem_missing", current.id)).rejects.toThrow(/not found/);
+      await expect(memoryStore.supersedeMemory(current.id, "mem_missing")).rejects.toThrow(/not found/);
+      await expect(memoryStore.supersedeMemory(current.id, current.id)).rejects.toThrow(/itself/);
+    });
+
+    it("rolls the whole supersede back when part of it fails", async () => {
+      const older = await remember("The cache lives in Redis.");
+      const newer = await remember("The cache lives in Postgres.");
+
+      // Blocking the relation insert — the last of the three writes — shows the
+      // two memory updates before it are undone with it.
+      db.exec(
+        "CREATE TRIGGER block_relations BEFORE INSERT ON memory_relations " +
+        "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+      );
+
+      // Caught by hand — expect().rejects does not reliably recognise the error
+      // class better-sqlite3 raises as a throw.
+      let error: any;
+      try {
+        await memoryStore.supersedeMemory(older.id, newer.id);
+      } catch (err) {
+        error = err;
+      } finally {
+        db.exec("DROP TRIGGER block_relations");
+      }
+
+      expect(error?.message).toContain("blocked");
+      expect((await memoryStore.getMemory(older.id))?.isLatest).toBe(true);
+      expect((await memoryStore.getMemory(newer.id))?.evolvesFromId).toBeUndefined();
+      expect(await memoryStore.listRelations(newer.id, { direction: "out" })).toEqual([]);
+    });
+
+    it("retires the earlier memory when a replacement is created outright", async () => {
+      const original = await remember("Logs go to stdout.");
+      const replacement = await memoryStore.createMemory({
+        sessionId: evolutionSessionId,
+        content: "Logs go to a rotating file.",
+        evolvesFromId: original.id,
+        evolvesRelation: "replaces"
+      });
+
+      expect(replacement.evolvesFromId).toBe(original.id);
+      expect((await memoryStore.getMemory(original.id))?.isLatest).toBe(false);
+    });
+
+    it("walks the chain oldest first", async () => {
+      const v1 = await remember("Hosted on Heroku.");
+      const v2 = await remember("Hosted on Fly.io.");
+      const v3 = await remember("Hosted on Railway.");
+
+      await memoryStore.supersedeMemory(v1.id, v2.id);
+      await memoryStore.supersedeMemory(v2.id, v3.id);
+
+      const fromMiddle = await memoryStore.getEvolutionChain(v2.id);
+      expect(fromMiddle.chain.map(c => c.id)).toEqual([v1.id, v2.id, v3.id]);
+      expect(fromMiddle.chain.map(c => c.isLatest)).toEqual([false, false, true]);
+      expect(fromMiddle.position).toBe(1);
+      expect(fromMiddle.totalVersions).toBe(3);
+
+      // Either end of the chain sees the same revisions.
+      expect((await memoryStore.getEvolutionChain(v1.id)).chain.map(c => c.id)).toEqual([v1.id, v2.id, v3.id]);
+      expect((await memoryStore.getEvolutionChain(v3.id)).position).toBe(2);
+    });
+
+    it("stops at maxDepth on a long chain", async () => {
+      const first = await remember("Step one.");
+      let previous = first;
+      for (let i = 2; i <= 5; i++) {
+        const next = await remember(`Step ${i}.`);
+        await memoryStore.supersedeMemory(previous.id, next.id);
+        previous = next;
+      }
+
+      expect((await memoryStore.getEvolutionChain(first.id, 2)).totalVersions).toBe(3);
+    });
+
+    it("terminates on a chain that loops back on itself", async () => {
+      const a = await remember("Cycle: first half.");
+      const b = await remember("Cycle: second half.");
+
+      // Nothing in the store writes a loop, but an imported or hand-edited row can.
+      db.prepare("UPDATE memories SET evolves_from_id = ? WHERE id = ?").run(b.id, a.id);
+      db.prepare("UPDATE memories SET evolves_from_id = ? WHERE id = ?").run(a.id, b.id);
+
+      const chain = await memoryStore.getEvolutionChain(a.id, 100);
+      expect(chain.chain.map(c => c.id)).toEqual([b.id, a.id]);
+      expect(chain.totalVersions).toBe(2);
+    });
+  });
+
+  describe("superseded memories in reads", () => {
+    let historySessionId: string;
+    let oldId: string;
+    let newId: string;
+
+    beforeAll(async () => {
+      const session = await sessionStore.createSession("History Project", "chrome");
+      historySessionId = session._id;
+
+      oldId = (await memoryStore.createMemory({
+        sessionId: historySessionId,
+        content: "The rate limit is 100 requests a minute."
+      })).id;
+      newId = (await memoryStore.createMemory({
+        sessionId: historySessionId,
+        content: "The rate limit is 500 requests a minute."
+      })).id;
+
+      await memoryStore.supersedeMemory(oldId, newId);
+    });
+
+    it("returns only the current memory by default", async () => {
+      expect((await memoryStore.getMemories(historySessionId)).map(m => m.id)).toEqual([newId]);
+      // Still readable by ID — superseded is history, not deleted.
+      expect(await memoryStore.getMemory(oldId)).not.toBeNull();
+    });
+
+    it("does not resurrect a superseded memory through another filter", async () => {
+      const matched = await memoryStore.getMemories(historySessionId, { query: "rate limit" });
+      expect(matched.map(m => m.id)).toEqual([newId]);
+    });
+
+    it("returns the superseded memory when the history is asked for", async () => {
+      const all = await memoryStore.getMemories(historySessionId, { includeSuperseded: true });
+      expect(all.map(m => m.id).sort()).toEqual([newId, oldId].sort());
+    });
+  });
+
   describe("working memory", () => {
     it("returns null before anything is saved", async () => {
       expect(await memoryStore.getWorkingMemory(sessionId)).toBeNull();

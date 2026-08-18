@@ -1,6 +1,8 @@
 import { v4 as uuidv4 } from "uuid";
 import { getSqlite } from "./sqlite";
-import { IMemoryStore, Memory, MemoryCategory, WorkingMemory } from "./storage.types";
+import {
+  IMemoryStore, Memory, MemoryCategory, MemoryRelation, MemoryRevision, WorkingMemory
+} from "./storage.types";
 
 /**
  * Importance is a REAL column, but callers still hand us the old level names
@@ -105,38 +107,42 @@ export class SqliteMemoryStore implements IMemoryStore {
     const labels = memory.labels || memory.tags || [];
     const labelsJson = JSON.stringify(labels);
 
-    this.db.prepare(`
-      INSERT INTO memories (
-        id, sessionId, title, content, importance, category, unit_type,
-        labels, tags, claim_status, evolves_from_id, evolves_relation,
-        is_latest, source, source_app, temporal_context, createdAt, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      memory.sessionId,
-      title,
-      memory.content,
-      normalizeImportance(memory.importance),
-      memory.category || "Note",
-      memory.unitType || "context",
-      labelsJson,
-      labelsJson,
-      memory.claimStatus || "asserted",
-      memory.evolvesFromId || null,
-      memory.evolvesRelation || null,
-      memory.isLatest === false ? 0 : 1,
-      memory.source || "manual",
-      memory.sourceApp || null,
-      memory.temporalContext || "timeless",
-      now,
-      now
-    );
+    // The insert and the retirement it triggers go in together: applying only
+    // one of them leaves two revisions of the same claim both marked latest.
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO memories (
+          id, sessionId, title, content, importance, category, unit_type,
+          labels, tags, claim_status, evolves_from_id, evolves_relation,
+          is_latest, source, source_app, temporal_context, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        memory.sessionId,
+        title,
+        memory.content,
+        normalizeImportance(memory.importance),
+        memory.category || "Note",
+        memory.unitType || "context",
+        labelsJson,
+        labelsJson,
+        memory.claimStatus || "asserted",
+        memory.evolvesFromId || null,
+        memory.evolvesRelation || null,
+        memory.isLatest === false ? 0 : 1,
+        memory.source || "manual",
+        memory.sourceApp || null,
+        memory.temporalContext || "timeless",
+        now,
+        now
+      );
 
-    // A replacement retires what it supersedes, so an is_latest filter returns
-    // one row per claim rather than every revision of it.
-    if (memory.evolvesFromId && memory.evolvesRelation === "replaces") {
-      this.db.prepare("UPDATE memories SET is_latest = 0 WHERE id = ?").run(memory.evolvesFromId);
-    }
+      // A replacement retires what it supersedes, so an is_latest filter returns
+      // one row per claim rather than every revision of it.
+      if (memory.evolvesFromId && memory.evolvesRelation === "replaces") {
+        this.db.prepare("UPDATE memories SET is_latest = 0 WHERE id = ?").run(memory.evolvesFromId);
+      }
+    })();
 
     this.syncFts(id, title, memory.content, labels);
 
@@ -151,10 +157,17 @@ export class SqliteMemoryStore implements IMemoryStore {
       query?: string;
       unitType?: string;
       limit?: number;
+      includeSuperseded?: boolean;
     }
   ): Promise<Memory[]> {
     let sql = "SELECT * FROM memories WHERE 1=1";
     const params: any[] = [];
+
+    // A superseded memory is history, not current knowledge — a reader asking
+    // what the project believes now must not be handed the claim it replaced.
+    if (!filters?.includeSuperseded) {
+      sql += " AND is_latest = 1";
+    }
 
     if (sessionId && sessionId !== "all") {
       sql += " AND sessionId = ?";
@@ -256,9 +269,210 @@ export class SqliteMemoryStore implements IMemoryStore {
   }
 
   async deleteMemory(id: string): Promise<boolean> {
+    // memory_relations cascades on both of its foreign keys, so the links into
+    // and out of this memory go with it.
     const result = this.db.prepare("DELETE FROM memories WHERE id = ?").run(id);
     this.db.prepare("DELETE FROM fts_memories WHERE memory_id = ?").run(id);
     return result.changes > 0;
+  }
+
+  private mapRelation(row: any): MemoryRelation {
+    return {
+      id: row.id,
+      sourceMemoryId: row.source_memory_id,
+      targetMemoryId: row.target_memory_id,
+      relationType: row.relation_type,
+      reason: row.reason || undefined,
+      strength: typeof row.strength === "number" ? row.strength : 1,
+      confidence: typeof row.confidence === "number" ? row.confidence : 1,
+      bidirectional: row.bidirectional === 1,
+      status: (row.status || "active") as MemoryRelation["status"],
+      createdAt: new Date(row.createdAt),
+      updatedAt: new Date(row.updatedAt)
+    };
+  }
+
+  async addRelation(relation: {
+    sourceMemoryId: string;
+    targetMemoryId: string;
+    relationType: string;
+    reason?: string;
+    strength?: number;
+    confidence?: number;
+    bidirectional?: boolean;
+    status?: "active" | "suggested";
+  }): Promise<MemoryRelation> {
+    const id = `rel_${uuidv4()}`;
+    const now = new Date().toISOString();
+
+    this.db.prepare(`
+      INSERT INTO memory_relations (
+        id, source_memory_id, target_memory_id, relation_type,
+        reason, strength, confidence, bidirectional, status, createdAt, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      relation.sourceMemoryId,
+      relation.targetMemoryId,
+      relation.relationType,
+      relation.reason || null,
+      relation.strength !== undefined ? relation.strength : 1,
+      relation.confidence !== undefined ? relation.confidence : 1,
+      relation.bidirectional ? 1 : 0,
+      relation.status || "active",
+      now,
+      now
+    );
+
+    return this.mapRelation(this.db.prepare("SELECT * FROM memory_relations WHERE id = ?").get(id));
+  }
+
+  async listRelations(
+    memoryId: string,
+    options?: { direction?: "out" | "in" | "both"; relationTypes?: string[]; status?: string; limit?: number }
+  ): Promise<MemoryRelation[]> {
+    const direction = options?.direction || "both";
+
+    let sql = "SELECT * FROM memory_relations WHERE status = ?";
+    const params: any[] = [options?.status || "active"];
+
+    if (direction === "out") {
+      sql += " AND source_memory_id = ?";
+      params.push(memoryId);
+    } else if (direction === "in") {
+      // A bidirectional link points back at its source as well.
+      sql += " AND (target_memory_id = ? OR (source_memory_id = ? AND bidirectional = 1))";
+      params.push(memoryId, memoryId);
+    } else {
+      sql += " AND (source_memory_id = ? OR target_memory_id = ?)";
+      params.push(memoryId, memoryId);
+    }
+
+    if (options?.relationTypes && options.relationTypes.length > 0) {
+      sql += ` AND relation_type IN (${options.relationTypes.map(() => "?").join(",")})`;
+      params.push(...options.relationTypes);
+    }
+
+    sql += " ORDER BY strength DESC, updatedAt DESC LIMIT ?";
+    params.push(options?.limit || 50);
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map(r => this.mapRelation(r));
+  }
+
+  async deleteRelation(relationId: string): Promise<boolean> {
+    return this.db.prepare("DELETE FROM memory_relations WHERE id = ?").run(relationId).changes > 0;
+  }
+
+  /**
+   * Returns every revision of a claim the given memory belongs to, oldest
+   * first, together with where in that chain the memory itself sits.
+   *
+   * Both walks record the ids they have already seen. Nothing here writes a
+   * loop, but an imported or hand-edited row can hold one, and following it
+   * blind would spin forever rather than returning a short chain.
+   */
+  async getEvolutionChain(memoryId: string, maxDepth: number = 10): Promise<{
+    chain: MemoryRevision[];
+    position: number;
+    totalVersions: number;
+  }> {
+    const root = await this.getMemory(memoryId);
+    if (!root) throw new Error(`Memory ${memoryId} not found`);
+
+    const visited = new Set<string>([root.id]);
+
+    const ancestors: Memory[] = [];
+    let olderId = root.evolvesFromId;
+    while (olderId && !visited.has(olderId) && ancestors.length < maxDepth) {
+      const ancestor = await this.getMemory(olderId);
+      if (!ancestor) break;
+      visited.add(ancestor.id);
+      ancestors.unshift(ancestor);
+      olderId = ancestor.evolvesFromId;
+    }
+
+    const descendants: Memory[] = [];
+    let newerOf = root.id;
+    while (descendants.length < maxDepth) {
+      const row = this.db.prepare("SELECT * FROM memories WHERE evolves_from_id = ?").get(newerOf) as any;
+      if (!row || visited.has(row.id)) break;
+      const descendant = this.mapMemory(row);
+      visited.add(descendant.id);
+      descendants.push(descendant);
+      newerOf = descendant.id;
+    }
+
+    const chain = [...ancestors, root, ...descendants];
+
+    return {
+      chain: chain.map(m => ({
+        id: m.id,
+        title: m.title,
+        unitType: m.unitType,
+        isLatest: m.isLatest === true,
+        createdAt: m.createdAt.toISOString(),
+        evolvesFromId: m.evolvesFromId,
+        evolvesRelation: m.evolvesRelation
+      })),
+      position: ancestors.length,
+      totalVersions: chain.length
+    };
+  }
+
+  /**
+   * Records that one memory replaced another. Retiring the old row, linking
+   * the new one to it and writing the typed link happen together: a supersede
+   * that lands halfway leaves both memories claiming to be current, which is
+   * exactly the state the is_latest filter exists to prevent.
+   *
+   * Only the evolution columns change, so fts_memories stays as it is.
+   */
+  async supersedeMemory(oldMemoryId: string, newMemoryId: string, reason?: string): Promise<{
+    status: string;
+    oldMemory: { id: string; isLatest: boolean };
+    newMemory: { id: string; isLatest: boolean; evolvesFromId: string };
+  }> {
+    if (oldMemoryId === newMemoryId) {
+      throw new Error("A memory cannot supersede itself");
+    }
+    if (!(await this.getMemory(oldMemoryId))) {
+      throw new Error(`Memory ${oldMemoryId} not found`);
+    }
+    if (!(await this.getMemory(newMemoryId))) {
+      throw new Error(`Memory ${newMemoryId} not found`);
+    }
+
+    const now = new Date().toISOString();
+    const relationId = `rel_${uuidv4()}`;
+
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE memories SET is_latest = 0, updatedAt = ? WHERE id = ?")
+        .run(now, oldMemoryId);
+
+      this.db.prepare(`
+        UPDATE memories SET
+          evolves_from_id = ?,
+          evolves_relation = 'replaces',
+          is_latest = 1,
+          updatedAt = ?
+        WHERE id = ?
+      `).run(oldMemoryId, now, newMemoryId);
+
+      // The same fact as a typed link, so relation queries see the supersede.
+      this.db.prepare(`
+        INSERT INTO memory_relations (
+          id, source_memory_id, target_memory_id, relation_type,
+          reason, strength, confidence, bidirectional, status, createdAt, updatedAt
+        ) VALUES (?, ?, ?, 'replaces', ?, 1, 1, 0, 'active', ?, ?)
+      `).run(relationId, newMemoryId, oldMemoryId, reason || null, now, now);
+    })();
+
+    return {
+      status: "superseded",
+      oldMemory: { id: oldMemoryId, isLatest: false },
+      newMemory: { id: newMemoryId, isLatest: true, evolvesFromId: oldMemoryId }
+    };
   }
 
   async getWorkingMemory(sessionId: string): Promise<WorkingMemory | null> {
