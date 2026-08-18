@@ -6,7 +6,7 @@ const router = Router();
 
 // GET /api/memories
 router.get("/", async (req: Request, res: Response) => {
-  const { sessionId, importance, category, unitType, query, limit } = req.query;
+  const { sessionId, importance, category, unitType, query, limit, includeSuperseded } = req.query;
 
   try {
     const memories = await memoryStore.getMemories(
@@ -16,7 +16,8 @@ router.get("/", async (req: Request, res: Response) => {
         category: typeof category === "string" ? category : undefined,
         unitType: typeof unitType === "string" ? unitType : undefined,
         query: typeof query === "string" ? query : undefined,
-        limit: typeof limit === "string" ? parseInt(limit, 10) : undefined
+        limit: typeof limit === "string" ? parseInt(limit, 10) : undefined,
+        includeSuperseded: includeSuperseded === "true"
       }
     );
     res.json({ success: true, memories });
@@ -38,6 +39,32 @@ router.get("/:id", async (req: Request, res: Response) => {
   } catch (err) {
     logger.error("Failed to fetch memory:", err);
     res.status(500).json({ error: "Failed to fetch memory" });
+  }
+});
+
+// GET /api/memories/:id/chain — every revision of this claim, oldest first
+router.get("/:id/chain", async (req: Request, res: Response) => {
+  try {
+    const chain = await memoryStore.getEvolutionChain(req.params.id as string);
+    res.json({ success: true, ...chain });
+  } catch (err) {
+    logger.error("Failed to fetch evolution chain:", err);
+    res.status(500).json({ error: "Failed to fetch evolution chain" });
+  }
+});
+
+// GET /api/memories/:id/relations
+router.get("/:id/relations", async (req: Request, res: Response) => {
+  const { direction } = req.query;
+
+  try {
+    const relations = await memoryStore.listRelations(req.params.id as string, {
+      direction: direction === "out" || direction === "in" ? direction : "both"
+    });
+    res.json({ success: true, relations });
+  } catch (err) {
+    logger.error("Failed to fetch memory relations:", err);
+    res.status(500).json({ error: "Failed to fetch memory relations" });
   }
 });
 
