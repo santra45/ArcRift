@@ -8,7 +8,7 @@ import helmet from "helmet";
 import path from "path";
 import fs from "fs";
 import { startWorker, clearAllJobs } from "./services/jobs";
-import { initStorage } from "./services/storage";
+import { initStorage, STORAGE_MODE } from "./services/storage";
 import { startAutoBackup } from "./services/backup";
 import { logger } from "./utils/logger";
 import contextRoutes from "./routes/context";
@@ -19,12 +19,14 @@ import sessionRoutes from "./routes/session";
 import jobsRoutes from "./routes/jobs";
 import healthRoutes from "./routes/health";
 import settingsRoutes from "./routes/settings";
+import memoriesRoutes from "./routes/memories";
+import workingMemoryRoutes from "./routes/workingMemory";
 
 
 // ── #9: .env validation — fail fast with a clear message ──────────
 function validateEnv() {
-  const STORAGE_MODE = (process.env.ARCRIFT_STORAGE_MODE || "docker").toLowerCase();
-
+  // Same resolved mode the storage layer picked, so a fresh install without
+  // Mongo/Neo4j is not rejected here for a mode it is not going to run in.
   if (STORAGE_MODE === "docker") {
     // NEO4J, MONGO are only required in Docker mode
     const required: Record<string, string> = {
@@ -122,6 +124,8 @@ app.use("/api/session", sessionRoutes);
 app.use("/api/jobs", jobsRoutes);
 app.use("/api/health", healthRoutes);
 app.use("/api/settings", settingsRoutes);
+app.use("/api/memories", memoriesRoutes);
+app.use("/api/working-memory", workingMemoryRoutes);
 
 // Health check — includes service status
 app.get("/health", (_req, res) => {

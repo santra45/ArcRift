@@ -111,3 +111,50 @@ export interface IVectorStore {
   deleteChunksByQuery(query: string, sessionId: string): Promise<number>;
   mergeSession(sourceId: string, targetId: string): Promise<void>;
 }
+
+export type MemoryCategory = "Architecture" | "Decision" | "Gotcha" | "Rule" | "Tech" | "Note";
+
+export interface Memory {
+  id: string;
+  sessionId: string;
+  title: string;
+  content: string;
+  /** 0–1. Stored as a REAL so memories can be ordered and thresholded. */
+  importance: number;
+  category: MemoryCategory;
+  unitType: "fact" | "preference" | "decision" | "plan" | "procedure" | "learning" | "context" | "event";
+  labels: string[];
+  /** Same list as `labels` — both names are accepted on write and returned on read. */
+  tags: string[];
+  claimStatus?: "asserted" | "explored" | "proposed" | "planned" | "unverified" | "deprecated" | "disputed";
+  evolvesFromId?: string;
+  evolvesRelation?: "replaces" | "enriches" | "confirms" | "challenges";
+  isLatest?: boolean;
+  source?: string;
+  sourceApp?: string;
+  temporalContext?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface WorkingMemory {
+  sessionId: string;
+  briefing: string;
+  focusAreas: string[];
+  activeDecisions: string[];
+  blockers: string[];
+  lastGeneratedAt: Date;
+  updatedAt: Date;
+}
+
+export interface IMemoryStore {
+  createMemory(memory: Partial<Memory> & { content: string; sessionId: string }): Promise<Memory>;
+  getMemories(sessionId?: string, filters?: { importance?: string | number; category?: string; query?: string; unitType?: string; limit?: number }): Promise<Memory[]>;
+  getMemory(id: string): Promise<Memory | null>;
+  updateMemory(id: string, update: Partial<Memory>): Promise<Memory | null>;
+  deleteMemory(id: string): Promise<boolean>;
+
+  // Working Memory
+  getWorkingMemory(sessionId: string): Promise<WorkingMemory | null>;
+  saveWorkingMemory(workingMemory: Partial<WorkingMemory> & { sessionId: string }): Promise<WorkingMemory>;
+}

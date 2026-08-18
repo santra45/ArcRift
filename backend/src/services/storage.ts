@@ -1,7 +1,8 @@
-import { ISessionStore, IGraphStore, IVectorStore, FullChat } from "./storage.types";
+import { ISessionStore, IGraphStore, IVectorStore, IMemoryStore, FullChat } from "./storage.types";
 import { SqliteSessionStore } from "./sqlite-session";
 import { SqliteGraphStore } from "./sqlite-graph";
 import { SqliteVectorStore } from "./sqlite-vector";
+import { SqliteMemoryStore } from "./sqlite-memory";
 import { logger } from "../utils/logger";
 
 // We will keep the legacy imports as "Docker" implementations
@@ -10,7 +11,17 @@ import * as mongoService from "./mongo";
 import * as neo4jService from "./neo4j";
 import * as chromaService from "./chroma";
 
-const STORAGE_MODE = (process.env.ARCRIFT_STORAGE_MODE || "docker").toLowerCase();
+/**
+ * An explicit ARCRIFT_STORAGE_MODE always wins. Without one we infer the mode
+ * from whether the Docker services are configured: existing installs have
+ * MONGO_URI/NEO4J_URI in their .env and keep working, while a fresh install
+ * with neither gets SQLite — and with it the memory features, which have no
+ * Mongo-backed implementation.
+ */
+export const STORAGE_MODE = (
+  process.env.ARCRIFT_STORAGE_MODE ||
+  (process.env.MONGO_URI || process.env.NEO4J_URI ? "docker" : "sqlite")
+).toLowerCase();
 
 class DockerSessionStore implements ISessionStore {
   private mapMongoSession(doc: any): any {
@@ -354,18 +365,39 @@ class DockerVectorStore implements IVectorStore {
   }
 }
 
+/**
+ * Memories live only in SQLite — there is no Mongo schema for them. Docker mode
+ * gets this stub so callers see one clear message instead of the SQLite store
+ * trying to open a database that initStorage() never opened.
+ */
+class UnsupportedMemoryStore implements IMemoryStore {
+  private unsupported(): never {
+    throw new Error("Memory features require SQLite storage mode");
+  }
+  async createMemory(): Promise<never> { return this.unsupported(); }
+  async getMemories(): Promise<never> { return this.unsupported(); }
+  async getMemory(): Promise<never> { return this.unsupported(); }
+  async updateMemory(): Promise<never> { return this.unsupported(); }
+  async deleteMemory(): Promise<never> { return this.unsupported(); }
+  async getWorkingMemory(): Promise<never> { return this.unsupported(); }
+  async saveWorkingMemory(): Promise<never> { return this.unsupported(); }
+}
+
 let sessionStore: ISessionStore;
 let graphStore: IGraphStore;
 let vectorStore: IVectorStore;
+let memoryStore: IMemoryStore;
 
 if (STORAGE_MODE === "sqlite") {
   sessionStore = new SqliteSessionStore();
   graphStore = new SqliteGraphStore();
   vectorStore = new SqliteVectorStore();
+  memoryStore = new SqliteMemoryStore();
 } else {
   sessionStore = new DockerSessionStore();
   graphStore = new DockerGraphStore();
   vectorStore = new DockerVectorStore();
+  memoryStore = new UnsupportedMemoryStore();
 }
 
 /**
@@ -396,4 +428,4 @@ export async function initStorage() {
 }
 
 export * from "./storage.types";
-export { sessionStore, graphStore, vectorStore };
+export { sessionStore, graphStore, vectorStore, memoryStore };

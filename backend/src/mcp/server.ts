@@ -38,6 +38,7 @@ import { listProjects } from "./tools/projects";
 import { getSummary } from "./tools/summary";
 import { identifyProject } from "./tools/detector";
 import { indexCodebase } from "./tools/index_codebase";
+import { getWorkingMemory, updateWorkingMemory } from "./tools/working_memory";
 import { initStorage, sessionStore } from "../services/storage";
 import { logger } from "../utils/logger";
 
@@ -150,6 +151,36 @@ const TOOLS = [
       },
       required: ["directoryPath"]
     }
+  },
+  {
+    name: "get_working_memory",
+    description:
+      "Get the standing briefing for a project: current focus, active decisions and known blockers. " +
+      "Call this at the start of a task to pick up where the project left off.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: { type: "string", description: "Project ID or name (defaults to the active project)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "update_working_memory",
+    description:
+      "Record or revise the standing briefing for a project. " +
+      "Fields that are omitted keep their current value.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: { type: "string", description: "Project ID or a NEW project name (auto-creates)" },
+        briefing: { type: "string", description: "Short summary of where the project stands" },
+        focusAreas: { type: "array", items: { type: "string" }, description: "What is being worked on now" },
+        activeDecisions: { type: "array", items: { type: "string" }, description: "Decisions already settled" },
+        blockers: { type: "array", items: { type: "string" }, description: "Open issues and gotchas" },
+      },
+      required: ["project"],
+    },
   }
 ];
 
@@ -245,6 +276,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolRes
       }
       case "index_codebase": {
         const result = await indexCodebase(args.directoryPath as string, args.sessionId as string | undefined);
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "get_working_memory": {
+        const result = await getWorkingMemory(args.project as string | undefined);
+        return { content: [{ type: "text", text: result }] };
+      }
+      case "update_working_memory": {
+        const result = await updateWorkingMemory(
+          args.project as string,
+          args.briefing as string | undefined,
+          args.focusAreas as string[] | undefined,
+          args.activeDecisions as string[] | undefined,
+          args.blockers as string[] | undefined
+        );
         return { content: [{ type: "text", text: result }] };
       }
       default:

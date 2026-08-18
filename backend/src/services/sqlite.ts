@@ -207,6 +207,79 @@ function createTables() {
     )
   `);
 
+  // Structured Memories
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      sessionId TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      importance REAL DEFAULT 0.5,
+      category TEXT DEFAULT 'Note',
+      unit_type TEXT DEFAULT 'context',
+      labels TEXT,
+      tags TEXT,
+      claim_status TEXT DEFAULT 'asserted',
+      evolves_from_id TEXT,
+      evolves_relation TEXT,
+      is_latest INTEGER DEFAULT 1,
+      source TEXT DEFAULT 'manual',
+      source_app TEXT,
+      temporal_context TEXT DEFAULT 'timeless',
+      createdAt TEXT,
+      updatedAt TEXT,
+      FOREIGN KEY(sessionId) REFERENCES sessions(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Migration: Add the classification columns to memories if missing
+  try {
+    const tableInfo = db.prepare("PRAGMA table_info(memories)").all() as any[];
+    if (!tableInfo.some(col => col.name === "unit_type")) {
+      db.exec("ALTER TABLE memories ADD COLUMN unit_type TEXT DEFAULT 'context'");
+      db.exec("ALTER TABLE memories ADD COLUMN labels TEXT");
+      db.exec("ALTER TABLE memories ADD COLUMN claim_status TEXT DEFAULT 'asserted'");
+      db.exec("ALTER TABLE memories ADD COLUMN evolves_from_id TEXT");
+      db.exec("ALTER TABLE memories ADD COLUMN evolves_relation TEXT");
+      db.exec("ALTER TABLE memories ADD COLUMN is_latest INTEGER DEFAULT 1");
+      db.exec("ALTER TABLE memories ADD COLUMN source_app TEXT");
+      db.exec("ALTER TABLE memories ADD COLUMN temporal_context TEXT DEFAULT 'timeless'");
+      logger.info("Database migration: Added classification columns to memories");
+    }
+  } catch (e) {
+    logger.warn(`Memories migration warning: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(sessionId)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_unit_type ON memories(unit_type)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_latest ON memories(is_latest)");
+
+  // Keyword search over memories
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+      memory_id UNINDEXED,
+      title,
+      content,
+      labels,
+      tokenize='porter'
+    )
+  `);
+
+  // Working Memory (one briefing per project)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS working_memory (
+      sessionId TEXT PRIMARY KEY,
+      briefing TEXT,
+      focusAreas TEXT,
+      activeDecisions TEXT,
+      blockers TEXT,
+      lastGeneratedAt TEXT,
+      updatedAt TEXT,
+      FOREIGN KEY(sessionId) REFERENCES sessions(id) ON DELETE CASCADE
+    )
+  `);
+
   migrateInvalidSessionIds();
 
   logger.success("All SQLite tables initialized successfully");
@@ -227,7 +300,9 @@ function createTables() {
  */
 function migrateInvalidSessionIds() {
   // Tables holding a plain sessionId column pointing at sessions.id
-  const referencingTables = ["full_chats", "facts", "chunk_metadata", "active_session"];
+  const referencingTables = [
+    "full_chats", "facts", "chunk_metadata", "active_session", "memories", "working_memory"
+  ];
 
   try {
     const invalid = (db.prepare("SELECT * FROM sessions").all() as any[])
