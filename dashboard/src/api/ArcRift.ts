@@ -78,6 +78,19 @@ export async function deleteGraphEdge(source: string, target: string, relation: 
   return res.data;
 }
 
+export type EmbeddingProvider = "ollama" | "openai-compatible" | "gemini";
+
+export interface EmbeddingSettings {
+  providers: EmbeddingProvider[];
+  provider: EmbeddingProvider;
+  baseUrl: string;
+  model: string;
+  dimension: number;
+  /** The key itself never leaves the backend — only whether one is stored. */
+  apiKeySet: boolean;
+  apiKeyHint: string;
+}
+
 export async function fetchSettings() {
   const res = await apiClient.get("/api/settings");
   return res.data as {
@@ -86,12 +99,138 @@ export async function fetchSettings() {
     activeEmbeddingModel: string;
     activeExtractionModel: string;
     contextMode: string;
+    embedding: EmbeddingSettings;
+    index: { provider: string; model: string; dimension: number; stale: boolean } | null;
   };
 }
 
-export async function updateSettings(data: { activeEmbeddingModel?: string; activeExtractionModel?: string; contextMode?: string }) {
+export async function updateSettings(data: {
+  activeEmbeddingModel?: string;
+  activeExtractionModel?: string;
+  contextMode?: string;
+  embeddingProvider?: EmbeddingProvider;
+  embeddingBaseUrl?: string;
+  /** Omit to keep the stored key; empty string clears it. */
+  embeddingApiKey?: string;
+  embeddingModel?: string;
+  embeddingDimension?: number;
+}) {
   const res = await apiClient.post("/api/settings", data);
+  return res.data as { success: boolean; embedding: EmbeddingSettings; reindexRequired: boolean };
+}
+
+export async function testEmbeddingProvider() {
+  const res = await apiClient.post("/api/settings/embedding/test");
+  return res.data as {
+    success: boolean;
+    provider: string;
+    model: string;
+    dimension: number;
+    expectedDimension: number;
+    latencyMs: number;
+  };
+}
+
+export async function reindexEmbeddings() {
+  const res = await apiClient.post("/api/rag/reindex");
   return res.data;
+}
+
+// ── Memories ─────────────────────────────────────────────────────────
+
+export interface Memory {
+  id: string;
+  sessionId: string;
+  title: string;
+  content: string;
+  importance: number;
+  category: string;
+  unitType: string;
+  labels: string[];
+  tags: string[];
+  claimStatus: string;
+  evolvesFromId?: string;
+  evolvesRelation?: string;
+  isLatest: boolean;
+  source?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryRelation {
+  id: string;
+  sourceMemoryId: string;
+  targetMemoryId: string;
+  relationType: string;
+  reason?: string;
+  strength: number;
+  confidence: number;
+  bidirectional: boolean;
+  status: string;
+}
+
+export async function fetchMemories(params: {
+  sessionId?: string;
+  query?: string;
+  category?: string;
+  importance?: string;
+  includeSuperseded?: boolean;
+}) {
+  const res = await apiClient.get("/api/memories", {
+    params: {
+      ...params,
+      includeSuperseded: params.includeSuperseded ? "true" : undefined
+    }
+  });
+  return res.data as { success: boolean; memories: Memory[] };
+}
+
+export async function fetchMemoryChain(id: string) {
+  const res = await apiClient.get(`/api/memories/${id}/chain`);
+  return res.data as {
+    success: boolean;
+    chain: { id: string; title: string; content: string; isLatest: boolean; evolvesRelation?: string; createdAt: string }[];
+    position: number;
+    totalVersions: number;
+  };
+}
+
+export async function fetchMemoryRelations(id: string) {
+  const res = await apiClient.get(`/api/memories/${id}/relations`);
+  return res.data as { success: boolean; relations: MemoryRelation[] };
+}
+
+export async function deleteMemory(id: string) {
+  const res = await apiClient.delete(`/api/memories/${id}`);
+  return res.data;
+}
+
+// ── Working memory ───────────────────────────────────────────────────
+
+export interface WorkingMemory {
+  sessionId: string;
+  briefing: string;
+  focusAreas: string[];
+  activeDecisions: string[];
+  blockers: string[];
+  lastGeneratedAt: string;
+  updatedAt: string;
+}
+
+/** Null when the project has no briefing recorded yet — a 404, not an error. */
+export async function fetchWorkingMemory(sessionId: string): Promise<WorkingMemory | null> {
+  try {
+    const res = await apiClient.get(`/api/working-memory/${sessionId}`);
+    return res.data.workingMemory as WorkingMemory;
+  } catch (err: any) {
+    if (err?.response?.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function saveWorkingMemory(sessionId: string, data: Partial<WorkingMemory>) {
+  const res = await apiClient.post(`/api/working-memory/${sessionId}`, data);
+  return res.data as { success: boolean; workingMemory: WorkingMemory };
 }
 
 export async function mergeSessions(sourceId: string, targetId: string) {

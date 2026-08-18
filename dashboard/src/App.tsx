@@ -6,6 +6,8 @@ import MainLayout from "./components/Layout/MainLayout";
 import { GlobalSearchView } from "./components/GlobalSearchView";
 import FloatingPanel from "./components/Panels/FloatingPanel";
 import SettingsView from "./components/SettingsView";
+import MemoriesView from "./components/MemoriesView";
+import WorkingMemoryView from "./components/WorkingMemoryView";
 
 import { apiClient, extractErrorMessage } from "./api/ArcRift";
 import type { Session } from "./types";
@@ -16,7 +18,7 @@ import { PAGE_SIZE } from "./constants";
 const App: React.FC = () => {
   // Navigation & UI State
   const [activeSession, setActiveSession] = useState<Session | null>(null);
-  const [activeMainTab, setActiveMainTab] = useState<"graph" | "search" | "settings">("graph");
+  const [activeMainTab, setActiveMainTab] = useState<"graph" | "search" | "memories" | "working" | "settings">("graph");
   const [activeSideTab, setActiveSideTab] = useState<"history" | "chat" | null>("history");
   const [loadedToExtension, setLoadedToExtension] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -278,6 +280,18 @@ const App: React.FC = () => {
         {activeMainTab === "search" && (
           <div style={{ position: "absolute", top: 0, left: 240, right: 0, bottom: 0, zIndex: 10, background: "var(--bg-deep)", overflowY: "auto" }}>
             <GlobalSearchView />
+          </div>
+        )}
+
+        {activeMainTab === "memories" && (
+          <div style={{ position: "absolute", top: 0, left: 240, right: 0, bottom: 0, zIndex: 10, background: "var(--bg-deep)", overflowY: "auto" }}>
+            <MemoriesView activeSession={activeSession} />
+          </div>
+        )}
+
+        {activeMainTab === "working" && (
+          <div style={{ position: "absolute", top: 0, left: 240, right: 0, bottom: 0, zIndex: 10, background: "var(--bg-deep)", overflowY: "auto" }}>
+            <WorkingMemoryView activeSession={activeSession} />
           </div>
         )}
 

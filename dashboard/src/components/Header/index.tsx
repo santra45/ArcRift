@@ -1,8 +1,8 @@
 import React from "react";
 
 interface HeaderProps {
-  activeMainTab: "graph" | "search" | "settings";
-  setActiveMainTab: (tab: "graph" | "search" | "settings") => void;
+  activeMainTab: "graph" | "search" | "memories" | "working" | "settings";
+  setActiveMainTab: (tab: "graph" | "search" | "memories" | "working" | "settings") => void;
   activeSideTab: "history" | "chat" | null;
   setActiveSideTab: (tab: "history" | "chat" | null) => void;
   isClosed: boolean;
@@ -53,6 +53,18 @@ const Header: React.FC<HeaderProps> = ({
           onClick={() => setActiveMainTab("search")}
         >
           Global Search
+        </button>
+        <button
+          className={`tab-btn ${activeMainTab === "memories" ? "active" : ""}`}
+          onClick={() => setActiveMainTab("memories")}
+        >
+          Memories
+        </button>
+        <button
+          className={`tab-btn ${activeMainTab === "working" ? "active" : ""}`}
+          onClick={() => setActiveMainTab("working")}
+        >
+          Working Memory
         </button>
         <button
           className={`tab-btn ${activeMainTab === "settings" ? "active" : ""}`}

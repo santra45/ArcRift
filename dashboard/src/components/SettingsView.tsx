@@ -1,8 +1,29 @@
 import React, { useEffect, useState, useMemo } from "react";
-import { fetchSettings, updateSettings, extractErrorMessage, fetchSessions } from "../api/ArcRift";
+import {
+  fetchSettings,
+  updateSettings,
+  extractErrorMessage,
+  fetchSessions,
+  testEmbeddingProvider,
+  reindexEmbeddings,
+  type EmbeddingProvider,
+  type EmbeddingSettings
+} from "../api/ArcRift";
+
+const PROVIDER_LABELS: Record<EmbeddingProvider, string> = {
+  ollama: "Ollama (local)",
+  "openai-compatible": "OpenAI-compatible",
+  gemini: "Google Gemini"
+};
+
+const PROVIDER_HINTS: Record<EmbeddingProvider, string> = {
+  ollama: "Runs on this machine. No key needed, nothing leaves the host.",
+  "openai-compatible": "Any endpoint speaking the OpenAI embeddings API — OpenAI itself, SiliconFlow, or a local gateway.",
+  gemini: "Google's hosted embedding models. Requires an API key."
+};
 
 const SettingsView: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<"config" | "analytics">("config");
+  const [activeTab, setActiveTab] = useState<"config" | "providers" | "analytics">("config");
   const [sessions, setSessions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +43,31 @@ const SettingsView: React.FC = () => {
 
   const [saving, setSaving] = useState(false);
 
+  // Embedding provider config. The key is write-only: the backend sends back a
+  // hint, never the value, so an untouched field must not be submitted.
+  const [embedding, setEmbedding] = useState<EmbeddingSettings | null>(null);
+  const [provider, setProvider] = useState<EmbeddingProvider>("ollama");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [dimension, setDimension] = useState(768);
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyTouched, setApiKeyTouched] = useState(false);
+  const [indexState, setIndexState] = useState<{ provider: string; model: string; stale: boolean } | null>(null);
+
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [reindexing, setReindexing] = useState(false);
+
+  const applyEmbedding = (next: EmbeddingSettings) => {
+    setEmbedding(next);
+    setProvider(next.provider);
+    setBaseUrl(next.baseUrl);
+    setEmbeddingModel(next.model);
+    setDimension(next.dimension);
+    setApiKey("");
+    setApiKeyTouched(false);
+  };
+
   const loadSettingsData = async () => {
     setLoading(true);
     setError(null);
@@ -38,6 +84,9 @@ const SettingsView: React.FC = () => {
         extraction: data.activeExtractionModel,
         contextMode: fetchedMode,
       });
+
+      if (data.embedding) applyEmbedding(data.embedding);
+      setIndexState(data.index);
 
       const sessionData = await fetchSessions();
       setSessions(sessionData.sessions || []);
@@ -74,6 +123,79 @@ const SettingsView: React.FC = () => {
       setError(`Failed to save settings: ${extractErrorMessage(err)}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const providerDirty =
+    !!embedding &&
+    (provider !== embedding.provider ||
+      baseUrl !== embedding.baseUrl ||
+      embeddingModel !== embedding.model ||
+      dimension !== embedding.dimension ||
+      apiKeyTouched);
+
+  const handleSaveProvider = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    setSuccessMessage(null);
+    setTestResult(null);
+    try {
+      const result = await updateSettings({
+        embeddingProvider: provider,
+        embeddingBaseUrl: baseUrl,
+        embeddingModel,
+        embeddingDimension: dimension,
+        // Leaving the field alone must not wipe the stored key.
+        ...(apiKeyTouched ? { embeddingApiKey: apiKey } : {})
+      });
+      applyEmbedding(result.embedding);
+      setSuccessMessage(
+        result.reindexRequired
+          ? "Provider saved. The existing index was built with different settings — rebuild it before searching."
+          : "Provider saved."
+      );
+      const refreshed = await fetchSettings();
+      setIndexState(refreshed.index);
+    } catch (err) {
+      setError(`Failed to save provider: ${extractErrorMessage(err)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestProvider = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await testEmbeddingProvider();
+      const mismatch = result.dimension !== result.expectedDimension;
+      setTestResult({
+        ok: !mismatch,
+        message: mismatch
+          ? `Reached ${result.model}, but it returned ${result.dimension} dimensions and the index holds ${result.expectedDimension}.`
+          : `${result.model} responded in ${result.latencyMs}ms with ${result.dimension} dimensions.`
+      });
+    } catch (err) {
+      setTestResult({ ok: false, message: extractErrorMessage(err) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleReindex = async () => {
+    if (!window.confirm("Re-embed every stored chunk with the current provider? This can take a while on a large project.")) return;
+    setReindexing(true);
+    setError(null);
+    try {
+      await reindexEmbeddings();
+      const refreshed = await fetchSettings();
+      setIndexState(refreshed.index);
+      setSuccessMessage("Index rebuilt with the current provider.");
+    } catch (err) {
+      setError(`Reindex failed: ${extractErrorMessage(err)}`);
+    } finally {
+      setReindexing(false);
     }
   };
 
@@ -141,6 +263,21 @@ const SettingsView: React.FC = () => {
           Configuration
         </button>
         <button
+          onClick={() => setActiveTab("providers")}
+          style={{
+            padding: "10px 24px", borderRadius: "8px", fontSize: "14px", fontWeight: 600,
+            background: activeTab === "providers" ? "var(--primary)" : "transparent",
+            color: activeTab === "providers" ? "#fff" : "var(--text-secondary)",
+            border: activeTab === "providers" ? "1px solid transparent" : "1px solid var(--border-main)",
+            cursor: "pointer", transition: "all 0.2s", display: "flex", alignItems: "center", gap: "8px"
+          }}
+        >
+          Embedding Provider
+          {indexState?.stale && (
+            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--danger)", boxShadow: "0 0 6px var(--danger)" }} />
+          )}
+        </button>
+        <button
           onClick={() => setActiveTab("analytics")}
           style={{
             padding: "10px 24px", borderRadius: "8px", fontSize: "14px", fontWeight: 600,
@@ -154,7 +291,7 @@ const SettingsView: React.FC = () => {
         </button>
       </div>
 
-      {activeTab === "config" ? (
+      {activeTab === "config" && (
       <form onSubmit={handleSave} style={{ background: "var(--surface)", border: "1px solid var(--border-main)", borderRadius: "16px", backdropFilter: "var(--surface-blur)", padding: "32px", display: "flex", flexDirection: "column", gap: "28px" }}>
         
         {/* Ollama Offline Warning Banner */}
@@ -286,7 +423,159 @@ const SettingsView: React.FC = () => {
           </button>
         </div>
       </form>
-      ) : (
+      )}
+
+      {activeTab === "providers" && (
+      <form onSubmit={handleSaveProvider} style={{ background: "var(--surface)", border: "1px solid var(--border-main)", borderRadius: "16px", backdropFilter: "var(--surface-blur)", padding: "32px", display: "flex", flexDirection: "column", gap: "28px" }}>
+
+        {indexState?.stale && (
+          <div style={{ background: "rgba(239, 68, 68, 0.08)", border: "1px solid rgba(239, 68, 68, 0.2)", borderRadius: "10px", padding: "16px", display: "flex", gap: "12px", alignItems: "flex-start" }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" strokeWidth="2" style={{ flexShrink: 0, marginTop: "2px" }}>
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01" />
+            </svg>
+            <div style={{ flex: 1 }}>
+              <h4 style={{ color: "var(--text-primary)", fontSize: "14px", fontWeight: 700, marginBottom: "4px" }}>Index does not match these settings</h4>
+              <p style={{ color: "var(--text-secondary)", fontSize: "12px", lineHeight: "1.4", marginBottom: "10px" }}>
+                Stored vectors were built with <strong>{indexState.model}</strong> on <strong>{indexState.provider}</strong>. Vectors from
+                different models are not comparable, so search stays blocked until the index is rebuilt.
+              </p>
+              <button
+                type="button"
+                onClick={handleReindex}
+                disabled={reindexing}
+                style={{ padding: "8px 16px", borderRadius: "8px", fontSize: "12px", fontWeight: 700, background: "var(--danger)", color: "white", border: "1px solid transparent", cursor: reindexing ? "not-allowed" : "pointer" }}
+              >
+                {reindexing ? "Rebuilding…" : "Rebuild index now"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Embedding Provider</label>
+          <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+            {PROVIDER_HINTS[provider]}
+          </p>
+          <select
+            className="settings-select"
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as EmbeddingProvider)}
+            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none", cursor: "pointer" }}
+          >
+            {(embedding?.providers || ["ollama"]).map((p) => (
+              <option key={p} value={p}>{PROVIDER_LABELS[p] || p}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Model</label>
+          <input
+            value={embeddingModel}
+            onChange={(e) => setEmbeddingModel(e.target.value)}
+            placeholder="nomic-embed-text"
+            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+          />
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Base URL</label>
+          <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+            Leave as-is unless you are pointing at a self-hosted or proxied endpoint.
+          </p>
+          <input
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+          />
+        </div>
+
+        {provider !== "ollama" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)", display: "flex", justifyContent: "space-between" }}>
+              <span>API Key</span>
+              {embedding?.apiKeySet && !apiKeyTouched && (
+                <span style={{ fontSize: "11px", fontWeight: 500, color: "var(--success)" }}>Stored: {embedding.apiKeyHint}</span>
+              )}
+            </label>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+              Held on this machine and never sent to the browser. Leave blank to keep the stored key.
+            </p>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => { setApiKey(e.target.value); setApiKeyTouched(true); }}
+              placeholder={embedding?.apiKeySet ? "•••••••• (unchanged)" : "Paste your key"}
+              autoComplete="off"
+              style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+            />
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Vector Dimension</label>
+          <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+            Fixed when the index was created. Changing it needs a full rebuild, and the provider must be able to return this width.
+          </p>
+          <input
+            type="number"
+            value={dimension}
+            onChange={(e) => setDimension(Number(e.target.value))}
+            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+          />
+        </div>
+
+        {testResult && (
+          <div style={{ background: testResult.ok ? "rgba(16, 185, 129, 0.08)" : "rgba(239, 68, 68, 0.08)", border: `1px solid ${testResult.ok ? "rgba(16, 185, 129, 0.2)" : "rgba(239, 68, 68, 0.2)"}`, borderRadius: "10px", padding: "14px", fontSize: "13px", color: testResult.ok ? "var(--success)" : "var(--danger)", fontWeight: 600 }}>
+            {testResult.message}
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid var(--border-main)", paddingTop: "24px", marginTop: "8px", gap: "16px" }}>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            {error && <span style={{ color: "var(--danger)", fontSize: "13px", fontWeight: 600 }}>{error}</span>}
+            {successMessage && <span style={{ color: "var(--success)", fontSize: "13px", fontWeight: 600 }}>{successMessage}</span>}
+            {!error && !successMessage && providerDirty && (
+              <span style={{ color: "var(--primary)", fontSize: "12px", fontWeight: 500 }}>Unsaved changes detected.</span>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+            <button
+              type="button"
+              onClick={handleTestProvider}
+              disabled={testing || providerDirty}
+              title={providerDirty ? "Save your changes first — the test uses the stored configuration" : undefined}
+              style={{
+                padding: "12px 20px", borderRadius: "10px", fontSize: "13px", fontWeight: 700,
+                background: "transparent", color: providerDirty ? "var(--text-dim)" : "var(--text-secondary)",
+                border: "1px solid var(--border-main)", cursor: testing || providerDirty ? "not-allowed" : "pointer"
+              }}
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </button>
+
+            <button
+              type="submit"
+              disabled={!providerDirty || saving}
+              style={{
+                padding: "12px 28px", borderRadius: "10px", fontSize: "14px", fontWeight: 700,
+                cursor: providerDirty && !saving ? "pointer" : "not-allowed",
+                background: providerDirty ? "var(--primary)" : "rgba(255,255,255,0.05)",
+                color: providerDirty ? "white" : "var(--text-dim)",
+                border: providerDirty ? "1px solid transparent" : "1px solid var(--border-dim)",
+                boxShadow: providerDirty ? "0 0 15px var(--primary-glow)" : "none",
+                transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)"
+              }}
+            >
+              {saving ? "Saving…" : "Save Provider"}
+            </button>
+          </div>
+        </div>
+      </form>
+      )}
+
+      {activeTab === "analytics" && (
         <div style={{ background: "var(--surface)", border: "1px solid var(--border-main)", borderRadius: "16px", backdropFilter: "var(--surface-blur)", padding: "32px", display: "flex", flexDirection: "column", gap: "28px" }}>
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             <h2 style={{ fontSize: "20px", fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>Global Telemetry</h2>
