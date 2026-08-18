@@ -44,8 +44,13 @@ import { memoryEvolvesChain } from "./tools/memory_evolves_chain";
 import { memoryRelationAdd } from "./tools/memory_relation_add";
 import { memoryRelationList } from "./tools/memory_relation_list";
 import { memoryRelationDelete } from "./tools/memory_relation_delete";
+import { DEFAULT_IMPORTANCE, IMPORTANCE_LEVELS, ImportanceLevel } from "./tools/importance";
 import { initStorage, sessionStore } from "../services/storage";
+import { MemoryCategory } from "../services/storage.types";
 import { logger } from "../utils/logger";
+
+/** Advertised to callers as an enum; mirrors the MemoryCategory union. */
+const MEMORY_CATEGORIES: MemoryCategory[] = ["Architecture", "Decision", "Gotcha", "Rule", "Tech", "Note"];
 
 // ── Tool definitions ────────────────────────────────────────────────
 const TOOLS = [
@@ -76,6 +81,10 @@ const TOOLS = [
       properties: {
         content: { type: "string", description: "The fact, decision, or context to remember" },
         project: { type: "string", description: "Project ID or a NEW project name (auto-creates)" },
+        title: { type: "string", description: "Title for the memory card (default: the first line of content)" },
+        importance: { type: "string", enum: IMPORTANCE_LEVELS, description: `How much this matters (default ${DEFAULT_IMPORTANCE})` },
+        category: { type: "string", enum: MEMORY_CATEGORIES, description: "What kind of memory this is (default Note)" },
+        tags: { type: "array", items: { type: "string" }, description: "Labels to file the memory card under" },
       },
       required: ["content", "project"],
     },
@@ -323,7 +332,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolRes
       case "store_memory": {
         const result = await store(
           args.content as string,
-          args.project as string
+          args.project as string,
+          args.importance as ImportanceLevel | number | undefined,
+          args.category as MemoryCategory | undefined,
+          args.title as string | undefined,
+          args.tags as string[] | undefined
         );
         return { content: [{ type: "text", text: result }] };
       }

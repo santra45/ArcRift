@@ -4,15 +4,33 @@
  * Manually save a new fact or context block into a project.
  */
 
-import { sessionStore, vectorStore } from "../../services/storage";
+import { memoryStore, sessionStore, vectorStore } from "../../services/storage";
+import { MemoryCategory } from "../../services/storage.types";
 import { enqueueJob } from "../../services/jobs";
 import { slidingWindowChunks } from "../../services/chunker";
 import { logger } from "../../utils/logger";
 import { mergeChatText, splitTurns } from "../../utils/chat-merge";
+import { DEFAULT_IMPORTANCE, ImportanceLevel, importanceLabel, importanceToScore } from "./importance";
+
+/** Long enough to tell two cards apart in a list, short enough to be a title. */
+const TITLE_MAX_LENGTH = 60;
+
+/**
+ * A card needs a title even when the caller did not think of one. The first
+ * line is what a note is usually headed with, minus the markdown that heads it.
+ */
+function deriveTitle(content: string): string {
+  const firstLine = content.split("\n")[0].replace(/^[#\s\-*]+/, "").trim();
+  return firstLine.slice(0, TITLE_MAX_LENGTH) || "Memory Item";
+}
 
 export async function store(
   content: string,
-  project: string
+  project: string,
+  importance: ImportanceLevel | number = DEFAULT_IMPORTANCE,
+  category: MemoryCategory = "Note",
+  title?: string,
+  tags?: string[]
 ): Promise<string> {
   try {
     const projectStr = String(project);
@@ -64,10 +82,35 @@ export async function store(
       processVectors: false // already stored above
     });
 
-    // 4. Update Stats — tripleCount is maintained by the extraction job.
+    // 4. Structured memory card — the content as one titled, filed entry.
+    // Best effort: memories are a SQLite-only feature, so in Docker mode this
+    // rejects by design, and the transcript above is what store_memory is for.
+    const cardTitle = title?.trim() || deriveTitle(content);
+    let cardCreated = false;
+
+    try {
+      await memoryStore.createMemory({
+        sessionId,
+        title: cardTitle,
+        content,
+        importance: importanceToScore(importance),
+        category,
+        tags: Array.isArray(tags) ? tags : [],
+        source: "mcp"
+      });
+      cardCreated = true;
+    } catch (err: any) {
+      logger.warn(`[ArcRift MCP] No memory card recorded for session "${sessionId}": ${err.message ?? String(err)}`);
+    }
+
+    // 5. Update Stats — tripleCount is maintained by the extraction job.
     await sessionStore.updateSession(sessionId, { updatedAt: new Date() });
 
-    return `Successfully stored memory in project "${session.projectName}" (${sessionId}).\n- Visible in Dashboard: Yes\n- Searchable now: Yes (${chunks.length} chunks indexed)\n- Fact extraction: running in the background`;
+    const cardLine = cardCreated
+      ? `\n- Memory Card Created: "${cardTitle}" [${importanceLabel(importance)}, ${category}]`
+      : "";
+
+    return `Successfully stored memory in project "${session.projectName}" (${sessionId}).${cardLine}\n- Visible in Dashboard: Yes\n- Searchable now: Yes (${chunks.length} chunks indexed)\n- Fact extraction: running in the background`;
   } catch (err: any) {
     return `store_memory failed: ${err.message ?? String(err)}`;
   }
