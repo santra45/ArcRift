@@ -306,6 +306,92 @@ export async function generateEmbeddings(texts: string[], task: "query" | "docum
 }
 
 /** Probes Ollama itself, whichever provider the index is embedded with. */
+export interface ProviderModel {
+  id: string;
+  label: string;
+  description?: string;
+  /** Dimension the provider advertises, when it says. */
+  dimension?: number;
+  /** False for models the provider lists but cannot embed with. */
+  embedding: boolean;
+}
+
+/**
+ * Ask a provider what it can run, so the model does not have to be typed from
+ * memory. Credentials are taken from the argument rather than the saved
+ * settings, so a key can be checked before it is committed to disk.
+ */
+export async function listProviderModels(override?: {
+  provider?: EmbeddingProvider;
+  baseUrl?: string;
+  apiKey?: string;
+}): Promise<ProviderModel[]> {
+  const saved = getEmbeddingConfig();
+  const provider = override?.provider || saved.provider;
+  const apiKey = override?.apiKey || (override?.provider && override.provider !== saved.provider ? "" : saved.apiKey);
+  const baseUrl = override?.baseUrl || (override?.provider && override.provider !== saved.provider ? "" : saved.baseUrl);
+
+  if (provider === "gemini") {
+    if (!apiKey) throw new Error("A Gemini API key is required to list models.");
+
+    const url = "https://generativelanguage.googleapis.com/v1beta/models";
+    const response = await axios.get(url, requestConfig(url, { "x-goog-api-key": apiKey }));
+    const models = Array.isArray(response.data?.models) ? response.data.models : [];
+
+    return models.map((m: any) => {
+      const id = String(m.name || "").replace(/^models\//, "");
+      const methods: string[] = Array.isArray(m.supportedGenerationMethods) ? m.supportedGenerationMethods : [];
+      return {
+        id,
+        label: m.displayName || id,
+        description: m.description,
+        // Gemini reports this only on some models; absent means "ask for what
+        // you want" rather than "fixed width".
+        dimension: typeof m.outputDimensionality === "number" ? m.outputDimensionality : undefined,
+        embedding: methods.includes("embedContent") || methods.includes("batchEmbedContents")
+      };
+    });
+  }
+
+  if (provider === "openai-compatible") {
+    const root = (baseUrl || "").replace(/\/+$/, "").replace(/\/embeddings$/, "");
+    if (!root) throw new Error("A base URL is required to list models.");
+
+    const url = `${root}/models`;
+    const headers: Record<string, string> = {};
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+    const response = await axios.get(url, requestConfig(url, headers));
+    const models = Array.isArray(response.data?.data) ? response.data.data : [];
+
+    return models.map((m: any) => {
+      const id = String(m.id || "");
+      return {
+        id,
+        label: id,
+        // No capability field in this API, so the name is the only signal.
+        embedding: /embed/i.test(id)
+      };
+    });
+  }
+
+  const root = (baseUrl || process.env.OLLAMA_URL || "http://localhost:11434").replace(/\/+$/, "");
+  const url = `${root}/api/tags`;
+  const response = await axios.get(url, requestConfig(url, {}));
+  const models = Array.isArray(response.data?.models) ? response.data.models : [];
+
+  return models.map((m: any) => {
+    const id = String(m.name || "");
+    return {
+      id,
+      label: id,
+      // Ollama does not say which models embed, so the name is the only signal
+      // and anything unmatched is still offered, just not promoted.
+      embedding: /embed/i.test(id)
+    };
+  });
+}
+
 export async function checkOllamaHealth(): Promise<boolean> {
   const config = getEmbeddingConfig();
   const baseUrl = config.provider === "ollama"

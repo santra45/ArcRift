@@ -131,6 +131,27 @@ export async function testEmbeddingProvider() {
   };
 }
 
+export interface ProviderModel {
+  id: string;
+  label: string;
+  description?: string;
+  dimension?: number;
+  embedding: boolean;
+}
+
+/**
+ * Credentials go in the body so a key can be browsed with before it is saved.
+ * Omitted fields fall back to whatever the backend already has stored.
+ */
+export async function listProviderModels(body: {
+  provider?: EmbeddingProvider;
+  baseUrl?: string;
+  apiKey?: string;
+}) {
+  const res = await apiClient.post("/api/settings/embedding/models", body);
+  return res.data as { success: boolean; provider: EmbeddingProvider; models: ProviderModel[] };
+}
+
 export async function reindexEmbeddings() {
   const res = await apiClient.post("/api/rag/reindex");
   return res.data;

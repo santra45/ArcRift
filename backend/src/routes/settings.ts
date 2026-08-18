@@ -2,11 +2,13 @@ import { Router, Request, Response } from "express";
 import axios from "axios";
 import {
   EmbeddingProvider,
+  baseUrlSuitsProvider,
+  defaultsForProvider,
   getEmbeddingConfig,
   getSettings,
   updateSettings
 } from "../utils/settings";
-import { generateEmbedding } from "../services/embeddings";
+import { generateEmbedding, listProviderModels } from "../services/embeddings";
 import { readIndexFingerprint } from "../services/index-fingerprint";
 import { logger } from "../utils/logger";
 
@@ -111,7 +113,16 @@ router.post("/", async (req: Request, res: Response) => {
     if (contextMode === "raw" || contextMode === "summarized") patch.contextMode = contextMode;
 
     if (embeddingProvider !== undefined) patch.embeddingProvider = embeddingProvider;
-    if (typeof embeddingBaseUrl === "string") patch.embeddingBaseUrl = embeddingBaseUrl;
+
+    if (typeof embeddingBaseUrl === "string") {
+      // A caller switching provider can easily send the endpoint the form was
+      // showing for the old one. Storing that produces requests aimed at the
+      // wrong service, which surfaces only as a 404 much later.
+      const target = embeddingProvider || getSettings().embeddingProvider || "ollama";
+      patch.embeddingBaseUrl = baseUrlSuitsProvider(target, embeddingBaseUrl)
+        ? embeddingBaseUrl
+        : defaultsForProvider(target).baseUrl;
+    }
     if (typeof embeddingModel === "string") patch.embeddingModel = embeddingModel;
     if (embeddingDimension !== undefined) patch.embeddingDimension = Number(embeddingDimension);
     // An empty string clears the key; omitting the field leaves it alone, so
@@ -143,6 +154,37 @@ router.post("/", async (req: Request, res: Response) => {
   } catch (err: any) {
     logger.error("Failed to update settings:", err?.message);
     res.status(500).json({ error: "Failed to save settings" });
+  }
+});
+
+// POST /api/settings/embedding/models — what the provider says it can run.
+// Takes credentials in the body so a key can be browsed with before it is
+// saved, falling back to the stored config when the body omits them.
+router.post("/embedding/models", async (req: Request, res: Response) => {
+  const { provider, baseUrl, apiKey } = req.body || {};
+
+  if (provider !== undefined && !isProvider(provider)) {
+    res.status(400).json({ error: `provider must be one of: ${EMBEDDING_PROVIDERS.join(", ")}` });
+    return;
+  }
+
+  try {
+    const models = await listProviderModels({
+      provider,
+      baseUrl: typeof baseUrl === "string" ? baseUrl : undefined,
+      apiKey: typeof apiKey === "string" ? apiKey : undefined
+    });
+
+    res.json({ success: true, provider: provider || getEmbeddingConfig().provider, models });
+  } catch (err: any) {
+    // A bad key or unreachable host is the user's to fix, not a server fault.
+    const status = err?.response?.status;
+    const detail =
+      status === 400 || status === 401 || status === 403
+        ? "The provider rejected these credentials."
+        : err?.message || String(err);
+    logger.warn(`Listing models failed for ${provider || "saved provider"}: ${err?.message}`);
+    res.status(502).json({ success: false, error: detail });
   }
 });
 

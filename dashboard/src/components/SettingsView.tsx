@@ -7,8 +7,18 @@ import {
   testEmbeddingProvider,
   reindexEmbeddings,
   type EmbeddingProvider,
-  type EmbeddingSettings
+  type EmbeddingSettings,
+  type ProviderModel
 } from "../api/ArcRift";
+import ModelPickerModal from "./ModelPickerModal";
+
+// Applied when switching provider, so the previous provider's endpoint does not
+// linger in the form and get saved against a backend that cannot use it.
+const PROVIDER_DEFAULTS: Record<EmbeddingProvider, { baseUrl: string; model: string }> = {
+  ollama: { baseUrl: "http://localhost:11434", model: "nomic-embed-text" },
+  "openai-compatible": { baseUrl: "https://api.openai.com/v1", model: "text-embedding-3-small" },
+  gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-embedding-001" }
+};
 
 const PROVIDER_LABELS: Record<EmbeddingProvider, string> = {
   ollama: "Ollama (local)",
@@ -54,9 +64,35 @@ const SettingsView: React.FC = () => {
   const [apiKeyTouched, setApiKeyTouched] = useState(false);
   const [indexState, setIndexState] = useState<{ provider: string; model: string; stale: boolean } | null>(null);
 
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [reindexing, setReindexing] = useState(false);
+
+  /**
+   * Switching provider carries nothing over. Keeping the old base URL meant
+   * pointing Gemini at a local Ollama port, which only surfaced as a confusing
+   * failure much later.
+   */
+  const handleProviderChange = (next: EmbeddingProvider) => {
+    setProvider(next);
+    setTestResult(null);
+    if (embedding && next === embedding.provider) {
+      setBaseUrl(embedding.baseUrl);
+      setEmbeddingModel(embedding.model);
+    } else {
+      setBaseUrl(PROVIDER_DEFAULTS[next].baseUrl);
+      setEmbeddingModel(PROVIDER_DEFAULTS[next].model);
+    }
+  };
+
+  const handleModelPicked = (model: ProviderModel) => {
+    setEmbeddingModel(model.id);
+    // Some providers pin a width; adopting it avoids saving a request the
+    // model cannot satisfy.
+    if (model.dimension) setDimension(model.dimension);
+    setTestResult(null);
+  };
 
   const applyEmbedding = (next: EmbeddingSettings) => {
     setEmbedding(next);
@@ -219,6 +255,19 @@ const SettingsView: React.FC = () => {
 
   return (
     <div style={{ maxWidth: "800px", margin: "100px auto 40px auto", padding: "0 24px" }}>
+      {pickerOpen && (
+        <ModelPickerModal
+          provider={provider}
+          baseUrl={baseUrl}
+          // Only pass a key the user just typed; otherwise the backend uses the
+          // one it already holds, which never reaches the browser.
+          apiKey={apiKeyTouched ? apiKey : ""}
+          currentModel={embeddingModel}
+          onSelect={handleModelPicked}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
+
       {/* Header Card */}
       <div style={{ background: "var(--surface)", border: "1px solid var(--border-main)", borderRadius: "16px", backdropFilter: "var(--surface-blur)", padding: "32px", marginBottom: "24px", position: "relative", overflow: "hidden" }}>
         <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: "3px", background: "linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%)" }} />
@@ -459,7 +508,7 @@ const SettingsView: React.FC = () => {
           <select
             className="settings-select"
             value={provider}
-            onChange={(e) => setProvider(e.target.value as EmbeddingProvider)}
+            onChange={(e) => handleProviderChange(e.target.value as EmbeddingProvider)}
             style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none", cursor: "pointer" }}
           >
             {(embedding?.providers || ["ollama"]).map((p) => (
@@ -470,12 +519,24 @@ const SettingsView: React.FC = () => {
 
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
           <label style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)" }}>Model</label>
-          <input
-            value={embeddingModel}
-            onChange={(e) => setEmbeddingModel(e.target.value)}
-            placeholder="nomic-embed-text"
-            style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
-          />
+          <p style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.4", marginBottom: "4px" }}>
+            Browse asks the provider what it can run, so the name does not have to be typed from memory.
+          </p>
+          <div style={{ display: "flex", gap: "12px" }}>
+            <input
+              value={embeddingModel}
+              onChange={(e) => setEmbeddingModel(e.target.value)}
+              placeholder="nomic-embed-text"
+              style={{ flex: 1, padding: "12px 16px", borderRadius: "10px", fontSize: "14px", background: "rgba(0,0,0,0.3)", border: "1px solid var(--border-main)", color: "white", outline: "none" }}
+            />
+            <button
+              type="button"
+              onClick={() => setPickerOpen(true)}
+              style={{ padding: "12px 20px", borderRadius: "10px", fontSize: "13px", fontWeight: 700, background: "transparent", color: "var(--text-secondary)", border: "1px solid var(--border-main)", cursor: "pointer", whiteSpace: "nowrap" }}
+            >
+              Browse…
+            </button>
+          </div>
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
