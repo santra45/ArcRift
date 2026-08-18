@@ -75,3 +75,16 @@ export function queryOne(selectors: string[]): Element | null {
   }
   return null;
 }
+
+// Same guard as queryAll/queryOne, for matching an element against a selector
+// list. Unguarded, one selector a browser cannot parse throws out of whichever
+// event handler called it — and the send-button handler is shared by every
+// platform, so a Gemini-only selector would break send detection everywhere.
+export function matchesAny(el: Element, selectors: string[]): boolean {
+  for (const sel of selectors) {
+    try {
+      if (el.closest(sel)) return true;
+    } catch { /* invalid selector */ }
+  }
+  return false;
+}

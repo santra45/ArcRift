@@ -13,6 +13,7 @@ import {
   getPlatformConfig,
   queryAll,
   queryOne,
+  matchesAny,
   type Platform,
 } from "./platforms/index";
 
@@ -505,7 +506,7 @@ async function handlePromptKeydown(e: KeyboardEvent) {
 async function handleSendButtonClick(e: MouseEvent) {
   if (isPaused || isProcessingPrompt || !config || !sessionId) return;
   const target = e.target as Element;
-  const isSendButton = config.sendButtonSelectors.some(sel => target.closest(sel));
+  const isSendButton = matchesAny(target, config.sendButtonSelectors);
   if (!isSendButton) return;
   const now = Date.now();
   if (now - lastSendTimestamp < 300) return;
