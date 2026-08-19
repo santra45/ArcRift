@@ -404,6 +404,25 @@ describe("rate limits", () => {
     await pending;
     expect(mockedAxios.post).toHaveBeenCalledTimes(2);
   });
+
+  it("normalises a gemini-embedding vector truncated below its native width", async () => {
+    mockConfig = { ...GEMINI_CONFIG, model: "gemini-embedding-001" };
+    mockedAxios.post.mockResolvedValueOnce({ data: { embedding: { values: vector(0.5) } } });
+
+    const result = await generateEmbedding("one text", "query");
+
+    const norm = Math.sqrt(result.reduce((sum, value) => sum + value * value, 0));
+    expect(norm).toBeCloseTo(1, 6);
+    expect(result[0]).toBeCloseTo(0.5 / Math.sqrt(768 * 0.25), 6);
+  });
+
+  it("leaves a model that returns its native width untouched", async () => {
+    mockedAxios.post.mockResolvedValueOnce({ data: { embedding: { values: vector(0.5) } } });
+
+    const result = await generateEmbedding("one text", "query");
+
+    expect(result[0]).toBe(0.5);
+  });
 });
 
 describe("index fingerprint", () => {

@@ -298,6 +298,28 @@ async function embedWithOpenAI(texts: string[], config: EmbeddingConfig): Promis
     .map((entry: any) => checkDimension(entry?.embedding, config));
 }
 
+/**
+ * gemini-embedding models are Matryoshka: asking for fewer than 3072 dimensions
+ * truncates the full vector rather than producing a native one, and what comes
+ * back is no longer unit length. Google's documentation puts normalising it on
+ * the caller.
+ *
+ * Skipping it does not fail, it degrades quietly — vec0 ranks by L2 distance,
+ * so un-normalised vectors let magnitude stand in for similarity and the
+ * ordering drifts with nothing looking wrong.
+ */
+function normalizeTruncated(values: number[], config: EmbeddingConfig): number[] {
+  if (!config.model.startsWith("gemini-embedding") || config.dimension >= 3072) return values;
+
+  let sumSquares = 0;
+  for (const value of values) sumSquares += value * value;
+  const norm = Math.sqrt(sumSquares);
+
+  // Newer models normalise their own truncations, so this is a no-op there.
+  if (!norm || Math.abs(norm - 1) < 1e-6) return values;
+  return values.map(value => value / norm);
+}
+
 // ── Google Gemini ──────────────────────────────────────────────────────
 async function embedWithGemini(texts: string[], config: EmbeddingConfig): Promise<number[][]> {
   if (!config.apiKey) {
@@ -317,7 +339,7 @@ async function embedWithGemini(texts: string[], config: EmbeddingConfig): Promis
       { content: { parts: [{ text: texts[0] }] }, outputDimensionality: config.dimension },
       requestConfig(url, headers)
     );
-    return [checkDimension(response.data?.embedding?.values, config)];
+    return [normalizeTruncated(checkDimension(response.data?.embedding?.values, config), config)];
   }
 
   const url = `${baseUrl}/models/${model}:batchEmbedContents`;
@@ -337,7 +359,7 @@ async function embedWithGemini(texts: string[], config: EmbeddingConfig): Promis
   if (!Array.isArray(embeddings)) {
     throw new Error("Gemini batchEmbedContents returned no embeddings");
   }
-  return embeddings.map((entry: any) => checkDimension(entry?.values, config));
+  return embeddings.map((entry: any) => normalizeTruncated(checkDimension(entry?.values, config), config));
 }
 
 function embedBatch(
