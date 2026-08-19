@@ -297,6 +297,115 @@ describe("embedding providers", () => {
   });
 });
 
+/** A refusal shaped the way Gemini shapes one, details and all. */
+function rateLimited(options: { quotaId?: string; retryDelay?: string } = {}) {
+  const err: any = new Error("Request failed with status code 429");
+  err.response = {
+    status: 429,
+    headers: {},
+    data: {
+      error: {
+        code: 429,
+        status: "RESOURCE_EXHAUSTED",
+        message: "You exceeded your current quota.",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            violations: [
+              { quotaId: options.quotaId ?? "EmbedContentRequestsPerMinutePerProjectPerModel-FreeTier" },
+            ],
+          },
+          ...(options.retryDelay
+            ? [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: options.retryDelay }]
+            : []),
+        ],
+      },
+    },
+  };
+  return err;
+}
+
+describe("rate limits", () => {
+  beforeEach(() => {
+    mockConfig = { ...GEMINI_CONFIG };
+    // These tests are about refusals and truncation, not pacing, so the limiter
+    // is lifted out of the way. The pacing tests set their own.
+    process.env.EMBEDDING_RPM = "100000";
+    process.env.EMBEDDING_TPM = "100000000";
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    delete process.env.EMBEDDING_RPM;
+    delete process.env.EMBEDDING_TPM;
+  });
+
+  it("waits as long as the provider asked before retrying", async () => {
+    jest.useFakeTimers();
+    mockedAxios.post
+      .mockRejectedValueOnce(rateLimited({ retryDelay: "24s" }))
+      .mockResolvedValueOnce({ data: { embedding: { values: vector() } } });
+
+    const pending = generateEmbedding("one text", "query");
+
+    await jest.advanceTimersByTimeAsync(23_000);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(2_000);
+    await expect(pending).resolves.toHaveLength(768);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a daily quota, which no wait will restore", async () => {
+    mockedAxios.post.mockRejectedValue(
+      rateLimited({ quotaId: "EmbedContentRequestsPerDayPerProjectPerModel-FreeTier" })
+    );
+
+    const message = await messageOf(() => generateEmbedding("one text", "query"));
+
+    expect(message).toContain("daily quota exhausted");
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the exhausted quota rather than only the status code", async () => {
+    jest.useFakeTimers();
+    mockedAxios.post.mockRejectedValue(rateLimited({ retryDelay: "1s" }));
+
+    const pending = messageOf(() => generateEmbedding("one text", "query"));
+    await jest.advanceTimersByTimeAsync(10_000);
+
+    expect(await pending).toContain("EmbedContentRequestsPerMinutePerProjectPerModel-FreeTier");
+  });
+
+  it("holds a batch back rather than spending a minute it does not have", async () => {
+    jest.useFakeTimers();
+    process.env.EMBEDDING_RPM = "25";
+    process.env.EMBEDDING_TPM = "100000000";
+
+    // A fresh module means a fresh window; the pacer's is deliberately shared
+    // process-wide so a query mid-re-index counts against the same allowance.
+    let paced: typeof import("../embeddings");
+    jest.isolateModules(() => {
+      paced = require("../embeddings");
+    });
+
+    mockedAxios.post.mockResolvedValue({
+      data: { embeddings: new Array(25).fill({ values: vector() }) },
+    });
+
+    // 30 texts is two Gemini batches, and Gemini bills every text in one, so the
+    // second cannot go out until the first batch ages out of the window.
+    const pending = paced!.generateEmbeddings(new Array(30).fill("text"), "document");
+
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(60_000);
+    await pending;
+    expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("index fingerprint", () => {
   let db: any;
 

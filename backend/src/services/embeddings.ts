@@ -19,8 +19,38 @@ const REQUEST_TIMEOUT = 60000;
 const BATCHING: Record<EmbeddingProvider, { size: number; delayMs: number }> = {
   "ollama": { size: 3, delayMs: 500 },
   "openai-compatible": { size: 64, delayMs: 0 },
-  "gemini": { size: 100, delayMs: 0 },
+  // Gemini meters every text inside a batch, not the call carrying them, so a
+  // 100-text batch spends a whole free-tier minute at once and leaves the pacer
+  // below nothing to spread. A smaller batch also loses less to a refusal.
+  "gemini": { size: 25, delayMs: 0 },
 };
+
+/**
+ * What a provider accepts per minute, counted the way that provider counts.
+ *
+ * Gemini charges each text in a batchEmbedContents call against the request
+ * quota, so a re-index that looks like two HTTP calls is really two hundred
+ * requests — which is how 275 chunks exhausted a 100/minute ceiling three
+ * seconds in. These are the free tier's figures; a paid key is worth far more,
+ * so both are overridable rather than holding every key at the lowest tier.
+ */
+const NO_LIMIT = Number.POSITIVE_INFINITY;
+
+const RATE_LIMITS: Record<EmbeddingProvider, { rpm: number; tpm: number }> = {
+  // Local, and the only thing metering it is the CPU.
+  "ollama": { rpm: NO_LIMIT, tpm: NO_LIMIT },
+  // Far too host-dependent to guess; the 429 handler covers it after the fact.
+  "openai-compatible": { rpm: NO_LIMIT, tpm: NO_LIMIT },
+  "gemini": { rpm: 100, tpm: 30_000 },
+};
+
+function rateLimitFor(provider: EmbeddingProvider) {
+  const defaults = RATE_LIMITS[provider] || RATE_LIMITS.ollama;
+  return {
+    rpm: Number(process.env.EMBEDDING_RPM) || defaults.rpm,
+    tpm: Number(process.env.EMBEDDING_TPM) || defaults.tpm,
+  };
+}
 
 /**
  * A provider returned a vector the index cannot hold.
@@ -32,6 +62,108 @@ const BATCHING: Record<EmbeddingProvider, { size: number; delayMs: number }> = {
 export class EmbeddingDimensionError extends Error {}
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+/** Requests and tokens already spent inside the trailing minute. */
+const spent: { at: number; requests: number; tokens: number }[] = [];
+
+/** Rough by necessity: providers bill tokens and all we hold is characters. */
+function estimateTokens(texts: string[]): number {
+  // Deliberately over-counts. Pacing under the real figure is what gets refused.
+  return texts.reduce((total, text) => total + Math.ceil(text.length / 3.5), 0);
+}
+
+/**
+ * Hold a call back until it fits inside the provider's minute.
+ *
+ * Waiting only once a 429 arrives throws away whatever that call had already
+ * computed, and against a daily-capped key the waste is permanent — the refused
+ * requests still count. So the window is tracked here and the call waits before
+ * it is made rather than after it is rejected.
+ */
+async function reserveQuota(provider: EmbeddingProvider, texts: string[]): Promise<void> {
+  const { rpm, tpm } = rateLimitFor(provider);
+  if (rpm === NO_LIMIT && tpm === NO_LIMIT) return;
+
+  const requests = texts.length;
+  const tokens = estimateTokens(texts);
+
+  for (;;) {
+    const now = Date.now();
+    while (spent.length && now - spent[0].at >= 60_000) spent.shift();
+
+    const usedRequests = spent.reduce((n, s) => n + s.requests, 0);
+    const usedTokens = spent.reduce((n, s) => n + s.tokens, 0);
+
+    // Nothing awaits between this test and the push, so two callers pacing at
+    // once cannot both read the same free capacity and claim it.
+    if (usedRequests + requests <= rpm && usedTokens + tokens <= tpm) {
+      spent.push({ at: now, requests, tokens });
+      return;
+    }
+
+    // A single call larger than the entire minute can never come to fit, and
+    // holding it forever is worse than letting the provider answer for itself.
+    if (spent.length === 0) {
+      logger.warn(
+        `[ArcRift] One ${provider} batch (${requests} texts, ~${tokens} tokens) exceeds the ` +
+        "per-minute allowance on its own — sending it and letting the provider decide."
+      );
+      spent.push({ at: now, requests, tokens });
+      return;
+    }
+
+    const waitMs = spent[0].at + 60_000 - now + 50;
+    logger.debug(
+      `[ArcRift] Pacing ${provider}: ${usedRequests}/${rpm} req, ${usedTokens}/${tpm} tok used — ` +
+      `waiting ${Math.ceil(waitMs / 1000)}s.`
+    );
+    await sleep(waitMs);
+  }
+}
+
+/** What a refusal actually said, for providers that say anything useful. */
+interface RateLimitInfo {
+  retryAfterMs: number;
+  quota: string;
+  /** A day's allowance does not come back before the day does. */
+  daily: boolean;
+}
+
+function rateLimitInfo(err: any): RateLimitInfo | null {
+  const status = err?.response?.status;
+  // 503 is overloaded rather than over quota, but backing off is the same answer.
+  if (status !== 429 && status !== 503) return null;
+
+  let retryAfterMs = 0;
+  let quota = "";
+
+  // Gemini attaches google.rpc.QuotaFailure and google.rpc.RetryInfo, which name
+  // the exhausted quota and how long it wants. axios flattens the message to
+  // "Request failed with status code 429" and the rest is lost unless read here.
+  const details = err?.response?.data?.error?.details;
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      const type = String(detail?.["@type"] || "");
+      if (type.endsWith("RetryInfo")) {
+        const seconds = parseFloat(String(detail?.retryDelay ?? ""));
+        if (Number.isFinite(seconds)) retryAfterMs = Math.ceil(seconds * 1000);
+      }
+      if (type.endsWith("QuotaFailure")) {
+        const violation = Array.isArray(detail?.violations) ? detail.violations[0] : null;
+        quota = violation?.quotaId || violation?.quotaMetric || "";
+      }
+    }
+  }
+
+  // OpenAI-compatible hosts carry it in the header instead.
+  const header = err?.response?.headers?.["retry-after"];
+  if (!retryAfterMs && header !== undefined) {
+    const seconds = parseFloat(String(header));
+    if (Number.isFinite(seconds)) retryAfterMs = Math.ceil(seconds * 1000);
+  }
+
+  return { retryAfterMs, quota, daily: /per_?day|daily/i.test(quota) };
+}
 
 function isLocalUrl(url: string): boolean {
   try {
@@ -231,28 +363,54 @@ async function embedBatchWithRetry(
 ): Promise<number[][]> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      if (attempt > 0) {
-        await sleep(5000 * attempt);
-        logger.debug(`[ArcRift] Retrying embedding generation (attempt ${attempt}/${MAX_RETRIES})...`);
-      }
-
+      await reserveQuota(config.provider, texts);
       return await embedBatch(texts, task, config);
     } catch (err: any) {
       // A wrong-width vector is a configuration problem; retrying only stalls.
       if (err instanceof EmbeddingDimensionError) throw err;
 
-      const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
-
       if (err.code === "ECONNREFUSED" && config.provider === "ollama") {
         throw new Error("Ollama is not running. Start it with: ollama serve");
       }
 
+      const limited = rateLimitInfo(err);
+      if (limited) {
+        const named = limited.quota ? ` (${limited.quota})` : "";
+
+        if (limited.daily) {
+          throw new Error(
+            `${config.provider} daily quota exhausted${named}. It resets on the provider's own ` +
+            "clock, so switch to a local model or a higher tier rather than waiting on a retry."
+          );
+        }
+
+        if (attempt < MAX_RETRIES) {
+          // The provider says how long it wants. Guessing shorter only earns
+          // another refusal, and each refusal still spends from the daily cap.
+          const waitMs = limited.retryAfterMs || Math.min(60_000, 5000 * 2 ** attempt);
+          logger.warn(
+            `[ArcRift] ${config.provider} rate limited${named} — waiting ${Math.ceil(waitMs / 1000)}s ` +
+            `before retry ${attempt + 1}/${MAX_RETRIES}.`
+          );
+          await sleep(waitMs);
+          continue;
+        }
+
+        logger.error("Embedding generation failed:", err?.message);
+        throw new Error(
+          `${config.provider} embedding failed (${config.model}): still rate limited${named} after ` +
+          `${MAX_RETRIES} retries. Lower EMBEDDING_RPM/EMBEDDING_TPM to pace further below the quota.`
+        );
+      }
+
+      const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
       if (isTimeout && attempt < MAX_RETRIES) {
         logger.warn(
           config.provider === "ollama"
             ? "[ArcRift] Embedding timeout. Ollama might be busy or model is loading."
             : `[ArcRift] Embedding timeout from ${config.provider}.`
         );
+        await sleep(5000 * (attempt + 1));
         continue;
       }
 
@@ -278,7 +436,11 @@ export async function generateEmbedding(text: string, task: "query" | "document"
  * Previously, 100 chunks = 100 concurrent HTTP calls (timed out).
  * Batch size and the rest between batches come from the provider.
  */
-export async function generateEmbeddings(texts: string[], task: "query" | "document" = "document"): Promise<number[][]> {
+export async function generateEmbeddings(
+  texts: string[],
+  task: "query" | "document" = "document",
+  onBatch?: (vectors: number[][], startIndex: number) => void
+): Promise<number[][]> {
   if (texts.length === 0) return [];
 
   const config = getEmbeddingConfig();
@@ -289,12 +451,19 @@ export async function generateEmbeddings(texts: string[], task: "query" | "docum
     const batch = texts.slice(i, i + size);
     logger.debug(`[ArcRift] Embedding batch ${Math.floor(i / size) + 1}/${Math.ceil(texts.length / size)}...`);
 
+    let vectors: number[][];
     try {
-      results.push(...await embedBatchWithRetry(batch, task, config));
+      vectors = await embedBatchWithRetry(batch, task, config);
     } catch (err: any) {
       logger.error(`[ArcRift] Batch embedding failed at index ${i}: ${err.message}`);
       throw err;
     }
+
+    results.push(...vectors);
+    // Handed over before the next batch goes out, so a caller can persist as it
+    // goes. On a daily-capped key the requests already paid for should survive
+    // a later refusal rather than being re-earned from the start.
+    onBatch?.(vectors, i);
 
     // Tiny rest to let a local CPU breathe. Hosted providers set this to 0.
     if (delayMs > 0 && i + size < texts.length) {

@@ -73,18 +73,23 @@ async function rewrite(
   const deleteVec = getSqlite().prepare(`DELETE FROM ${table} WHERE ${idColumn} = ?`);
   const insertVec = getSqlite().prepare(`INSERT INTO ${table} (${idColumn}, embedding) VALUES (?, ?)`);
 
-  let done = 0;
-  for (const slice of slices(rows)) {
-    const vectors = await generateEmbeddings(slice.map(r => r.content), "document");
-
+  const persist = (batch: { id: string; content: string }[], vectors: number[][]) =>
     getSqlite().transaction(() => {
-      for (let i = 0; i < slice.length; i++) {
-        deleteVec.run(slice[i].id);
-        insertVec.run(slice[i].id, Buffer.from(new Float32Array(vectors[i]).buffer));
+      for (let i = 0; i < vectors.length; i++) {
+        deleteVec.run(batch[i].id);
+        insertVec.run(batch[i].id, Buffer.from(new Float32Array(vectors[i]).buffer));
       }
     })();
 
-    done += slice.length;
-    logger.debug(`[ArcRift] Re-indexed ${done}/${rows.length} row(s) of ${table}`);
+  let done = 0;
+  for (const slice of slices(rows)) {
+    // Written as each embedding call lands rather than once the whole slice is
+    // in hand. A hosted provider can refuse part way through, and re-earning
+    // vectors it already returned costs quota a capped key does not get back.
+    await generateEmbeddings(slice.map(r => r.content), "document", (vectors, startIndex) => {
+      persist(slice.slice(startIndex, startIndex + vectors.length), vectors);
+      done += vectors.length;
+      logger.debug(`[ArcRift] Re-indexed ${done}/${rows.length} row(s) of ${table}`);
+    });
   }
 }
